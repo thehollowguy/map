@@ -493,11 +493,6 @@ function StratAI.new(config)
     self.player_profile = { years_observed = 0, rush = 0.5, turtle = 0.5, tech_greedy = 0.5, diplomacy = 0.5, fleet_overbuild = 0.5, border_neglect = 0.5, archetype = "Opportunist" }
     self.strategic_memory = { grudges = {}, patience_targets = {}, coalition_targets = {}, strongest_empire = nil }
     self.friend_state = { intent = { goal = "economy", risk = 0.4, attention = "core" }, notices = {}, rescue_cooldown = 0 }
-    self.strongest_meta = nil
-    self.meta_hysteresis = { strategy = nil, lock = 0 }
-    self.active_counter_meta = nil
-    self.opponent_meta_confidence = 0
-    self.meta_effectiveness = { by_meta = {}, by_counter = {} }
 
     return self
 end
@@ -2285,6 +2280,18 @@ function StratAI:campaign_templates()
     }
 end
 
+function StratAI:campaign_templates()
+    return {
+        economic_boom = { focus = { "build", "research", "colonize" }, risk = 0.35, doctrine = "balanced" },
+        defensive_turtle = { focus = { "seal_borders", "delay_stockpile", "redesign_fleet" }, risk = 0.25, doctrine = "balanced" },
+        tech_rush = { focus = { "research", "build" }, risk = 0.4, doctrine = "balanced" },
+        naval_supremacy = { focus = { "build", "redesign_fleet", "declare_war" }, risk = 0.58, doctrine = "anti_evasion" },
+        opportunistic_war = { focus = { "declare_war", "seal_borders", "seek_vassalization" }, risk = 0.63, doctrine = "anti_shield" },
+        containment_war = { focus = { "tech_denial", "declare_war", "probe_skirmish" }, risk = 0.55, doctrine = "anti_armor" },
+        vassalization_campaign = { focus = { "seek_vassalization", "vassalization_chain", "probe_diplomacy" }, risk = 0.5, doctrine = "balanced" }
+    }
+end
+
 function StratAI:_plan_bias_multiplier(action, plan)
     local p = self:campaign_templates()[plan] or self:campaign_templates().economic_boom
     for _, t in ipairs(p.focus or {}) do
@@ -2716,40 +2723,6 @@ function StratAI:crisis_total_war_score(state, action)
     return 0
 end
 
-function StratAI:_action_matches_pattern(action, pattern)
-    if not action or not pattern then return false end
-    local key = (action.type or "") .. "_" .. (action.target or "")
-    local p = tostring(pattern):gsub("%+", "")
-    return key:find(p, 1, true) ~= nil
-end
-
-function StratAI:_apply_weight_blend(score, action, mods, blend)
-    local m = mods or {}
-    local b = clamp(safe_number(blend, 0), 0, 1)
-    local mul = 1.0
-    if action.type == "declare_war" or action.type == "containment_front" then mul = mul + b * ((m.Mil or 1) - 1) end
-    if action.type == "research" or action.type == "tech_denial" then mul = mul + b * ((m.Tech or 1) - 1) end
-    if action.type == "build" or action.type == "delay_stockpile" then mul = mul + b * ((m.Eco or 1) - 1) end
-    if action.type == "seal_borders" or action.type == "fortify_chokepoint" then mul = mul + b * ((m.Pos or 1) - 1) end
-    if action.type == "hold_line_primary" or action.type == "hold_line_secondary" then mul = mul + b * ((m.Stab or 1) - 1) end
-    return score * clamp(mul, 0.7, 1.8)
-end
-
-function StratAI:_update_meta_effectiveness(meta_name, counter_name, score)
-    if meta_name and meta_name ~= "none" then
-        local b = self.meta_effectiveness.by_meta
-        b[meta_name] = b[meta_name] or { n = 0, reward = 0 }
-        b[meta_name].n = b[meta_name].n + 1
-        b[meta_name].reward = 0.97 * b[meta_name].reward + 0.03 * safe_number(score, 0)
-    end
-    if counter_name and counter_name ~= "none" then
-        local b = self.meta_effectiveness.by_counter
-        b[counter_name] = b[counter_name] or { n = 0, reward = 0 }
-        b[counter_name].n = b[counter_name].n + 1
-        b[counter_name].reward = 0.97 * b[counter_name].reward + 0.03 * safe_number(score, 0)
-    end
-end
-
 function StratAI:select_best_action(state, phase)
     local actions = self:generate_actions(state)
     local best_action = nil
@@ -2763,12 +2736,6 @@ function StratAI:select_best_action(state, phase)
     local future_priority = clamp(safe_number((self.config.strategic or {}).future_priority, 0.92), 0.5, 0.99)
     local campaign_plan, _campaign_score = self:select_campaign_plan(state, phase)
     local intel_conf = self:hidden_info_confidence(state)
-    local active_meta = self:select_meta_strategy(state)
-    local counter_meta = self.active_counter_meta
-
-    if active_meta and active_meta.bottleneck_override_suggestion then active_bottleneck = active_meta.bottleneck_override_suggestion end
-    if counter_meta and counter_meta.bottleneck_override_suggestion then active_bottleneck = counter_meta.bottleneck_override_suggestion end
-    if active_meta and active_meta.curiosity_block_exploration then curiosity_on = false end
     local in_friend_mode = (state.friend_mode == true) or ((self.config.friend_mode or {}).enabled == true)
     local player_intent = self:infer_player_intent(state)
     local crisis_eta = self:galactic_collapse_eta(state)
@@ -2822,31 +2789,6 @@ function StratAI:select_best_action(state, phase)
         local present_score = self:evaluate_state(present, phase)
         local score = future_priority * future_score + (1 - future_priority) * present_score
         score = score * self:_plan_bias_multiplier(action, campaign_plan)
-        score = score * self:meta_action_bias(action, projected)
-
-        if active_meta then
-            score = self:_apply_weight_blend(score, action, active_meta.weight_modifiers, 0.22 * safe_number(active_meta.confidence, 0.5))
-            for _, pat in ipairs(active_meta.priority_boost_actions or {}) do
-                if self:_action_matches_pattern(action, pat) then
-                    score = score + 0.20 * safe_number(active_meta.confidence, 0.5)
-                    break
-                end
-            end
-        end
-
-        if counter_meta then
-            local conf = clamp(self.opponent_meta_confidence or 0, 0, 1)
-            for _, pat in ipairs(counter_meta.our_priority_boost_actions or {}) do
-                if self:_action_matches_pattern(action, pat) then
-                    score = score + 0.25 * conf
-                    break
-                end
-            end
-            score = self:_apply_weight_blend(score, action, counter_meta.our_weight_modifiers, 0.30 * conf)
-            if counter_meta.doctrine_override and action.type == "redesign_fleet" then
-                score = score + 0.15
-            end
-        end
         score = self:uncertainty_adjusted_score(score, projected)
         score = score * (0.75 + 0.25 * intel_conf)
         score = score - self:identity_consistency_penalty(action)
@@ -2911,8 +2853,7 @@ function StratAI:select_best_action(state, phase)
             if in_friend_mode then
                 self:record_decision_why(action, "Selected by friend-support trajectory", state)
             else
-                local meta_name = active_meta and active_meta.strategy_name or "none"
-                self:record_decision_why(action, "Selected by campaign trajectory with survivable present (meta=" .. tostring(meta_name) .. ")", state)
+                self:record_decision_why(action, "Selected by campaign trajectory with survivable present", state)
             end
         end
 
@@ -3233,9 +3174,6 @@ function StratAI:tick(raw_observation)
     state.player_archetype = (self.player_profile or {}).archetype
     state.friend_notices = deep_copy((self.friend_state or {}).notices or {})
     state.galactic_collapse_eta = self:galactic_collapse_eta(state)
-    state.active_meta_strategy = self.strongest_meta and self.strongest_meta.strategy_name or "none"
-    state.active_counter_meta_strategy = self.active_counter_meta and self.active_counter_meta.our_strategy_name or "none"
-    state.opponent_detected = self.active_counter_meta and "Meta spammer countered" or "No counter needed"
 
     local action, score = self:select_best_action(state, phase)
     state.eval_explain = self:explain_eval_snapshot(state)
@@ -3254,7 +3192,6 @@ function StratAI:tick(raw_observation)
     state.self_critique = self:self_critique(state)
     state.domain_confidence = self:update_domain_confidence(state)
     self:update_meta_learning(state, action, score)
-    self:_update_meta_effectiveness(state.active_meta_strategy, state.active_counter_meta_strategy, score)
     return action, score, self.last_eval
 end
 
