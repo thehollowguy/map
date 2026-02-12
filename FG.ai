@@ -327,6 +327,14 @@ function AI:new(player, opponent, config)
             jump_after_block_light = 0,
             block_light_trials = 0,
             personalized_bait_timing = 6
+        },
+        situation_memory = {
+            buckets = {},
+            decay = 0.985
+        },
+        conditioning_effects = {
+            by_our_action = {},
+            decay = 0.97
         }
     }
 
@@ -418,7 +426,9 @@ function AI:new(player, opponent, config)
         games_played = 0,
         winrate = {},
         personas = {},
-        helt = { aggressive = 0, defensive = 0, balanced = 0 }
+        helt = { aggressive = 0, defensive = 0, balanced = 0 },
+        populations = { aggressive = {}, defensive = {}, balanced = {}, grappler = {}, zoner = {}, randomizer = {}, anti_adaptation = {}, sandbag = {} },
+        nash_anchor = { priors = { block = 0.22, walk_back = 0.20, light = 0.26, throw = 0.12, jump = 0.10, heavy = 0.06, special = 0.04 }, confidence = 0.25 }
     }
 
     self.meta_controller = {
@@ -477,6 +487,7 @@ function AI:new(player, opponent, config)
     self.muzero = nil
     self.muzero_replay = {}
     self.muzero_stats = { updates = 0, last_loss = 0 }
+    self.distilled_policy = { table = {}, visits = {}, confidence = 0.0 }
     self.causal_trace = {}
     self.opponent_shaping = { revealed_weakness = false, bait_window = 0, conditioned = 0 }
 
@@ -703,6 +714,91 @@ function AI:_observeState()
     return noisy
 end
 
+function AI:_playerArchetypeLabel()
+    local style = self.player_model.style or {}
+    if (style.aggression or 0.5) > 0.62 then return "rushdown" end
+    if (style.backdash_frequency or 0.5) > 0.58 then return "defensive" end
+    if (style.panic_reversal or 0) > 0.45 then return "volatile" end
+    return "balanced"
+end
+
+function AI:_situationKey(observation, archetype_override)
+    local obs = observation or {}
+    local arch = archetype_override or self:_playerArchetypeLabel()
+
+    local dist = math.abs((obs.px or 0) - (obs.ox or 0))
+    local screen = GAME_CONSTANTS.SCREEN_W or 800
+    local corner = "mid"
+    if (obs.px or 0) < 0.16 * screen then corner = "left_corner" end
+    if (obs.px or 0) > 0.84 * screen then corner = "right_corner" end
+
+    local adv = obs.p_frame_adv or 0
+    local adv_bucket = "even"
+    if adv <= -4 then adv_bucket = "neg" elseif adv >= 4 then adv_bucket = "plus" end
+
+    local hp_delta = (obs.p_health or 100) - (obs.o_health or 100)
+    local life_state = "even"
+    if hp_delta <= -15 then life_state = "behind" elseif hp_delta >= 15 then life_state = "ahead" end
+
+    local last_outcome = "neutral"
+    if (obs.p_hitstun or 0) > 0 then last_outcome = "got_hit" elseif (obs.o_hitstun or 0) > 0 then last_outcome = "scored_hit" elseif (obs.p_blockstun or 0) > 0 then last_outcome = "under_pressure" end
+
+    local pressure_bucket = "light"
+    local pressure_frames = self.player_model.conditioning_memory.pressure_frames or 0
+    if pressure_frames > 18 then pressure_bucket = "heavy" elseif pressure_frames > 8 then pressure_bucket = "medium" end
+
+    local knockdown = ((obs.p_on_ground == true) and ((obs.p_hitstun or 0) > 0)) and "hard_knockdown" or "standing"
+    local risk = (life_state == "behind") and "desperate" or ((life_state == "ahead") and "protect_lead" or "even_risk")
+
+    local spacing = "mid"
+    if dist < 90 then spacing = "close" elseif dist > 220 then spacing = "far" end
+
+    return table.concat({ arch, corner, adv_bucket, life_state, last_outcome, pressure_bucket, knockdown, risk, spacing }, "|")
+end
+
+function AI:_situationActionPrior(observation, action)
+    local sm = self.player_model.situation_memory or {}
+    local buckets = sm.buckets or {}
+    local key = self:_situationKey(observation)
+    local generic_key = self:_situationKey(observation, "generic")
+
+    local function prob(bucket)
+        if not bucket then return nil end
+        local total = 0
+        for _, c in pairs(bucket.actions or {}) do total = total + c end
+        if total <= 1e-6 then return nil end
+        return (bucket.actions[action] or 0) / total
+    end
+
+    local p_specific = prob(buckets[key])
+    local p_generic = prob(buckets[generic_key])
+    local p = 0.5 * (p_specific or 0) + 0.5 * (p_generic or 0)
+    if p <= 0 then return 1.0 end
+    return clamp(0.75 + 2.0 * p, 0.7, 1.6)
+end
+
+function AI:_conditioningResponseBias(observation, action)
+    local ce = self.player_model.conditioning_effects or {}
+    local by = ce.by_our_action or {}
+    local my = self.last_action or "idle"
+    local key = self:_situationKey(observation)
+    local generic_key = self:_situationKey(observation, "generic")
+
+    local function action_prob(bucket)
+        if not bucket then return nil end
+        local total = 0
+        for _, c in pairs(bucket.responses or {}) do total = total + c end
+        if total <= 1e-6 then return nil end
+        return (bucket.responses[action] or 0) / total
+    end
+
+    local p_specific = action_prob((((by[my] or {}).situations or {})[key]))
+    local p_generic = action_prob((((by[my] or {}).situations or {})[generic_key]))
+    local p = 0.6 * (p_specific or 0) + 0.4 * (p_generic or 0)
+    if p <= 0 then return 1.0 end
+    return clamp(0.8 + 1.8 * p, 0.7, 1.7)
+end
+
 function AI:_updatePlayerModel(observation, player_action)
     if not self.config.ablations.player_model then return end
     local action = player_action or "unknown"
@@ -716,11 +812,54 @@ function AI:_updatePlayerModel(observation, player_action)
     local ckey = string.format("%s|%s|%s", self.last_action or "idle", phase, action)
     self.player_model.conditional[ckey] = (self.player_model.conditional[ckey] or 0) + 1
 
+    if self.frame % 30 == 0 then
+        local f = 0.992
+        for k, v in pairs(self.player_model.long_term_counts) do
+            local nv = v * f
+            if nv < 0.02 then self.player_model.long_term_counts[k] = nil else self.player_model.long_term_counts[k] = nv end
+        end
+        for k, v in pairs(self.player_model.conditional) do
+            local nv = v * f
+            if nv < 0.02 then self.player_model.conditional[k] = nil else self.player_model.conditional[k] = nv end
+        end
+    end
+
+    local sm = self.player_model.situation_memory
+    local sm_decay = sm.decay or 0.985
+    local skey = self:_situationKey(observation)
+    local gkey = self:_situationKey(observation, "generic")
+    sm.buckets[skey] = sm.buckets[skey] or { n = 0, actions = {} }
+    sm.buckets[gkey] = sm.buckets[gkey] or { n = 0, actions = {} }
+    for _, key in ipairs({ skey, gkey }) do
+        local bucket = sm.buckets[key]
+        for a, c in pairs(bucket.actions) do
+            local nv = c * sm_decay
+            if nv < 0.01 then bucket.actions[a] = nil else bucket.actions[a] = nv end
+        end
+        bucket.n = (bucket.n or 0) * sm_decay + 1
+        bucket.actions[action] = (bucket.actions[action] or 0) + 1
+    end
+
+    local ce = self.player_model.conditioning_effects
+    local ca = self.last_action or "idle"
+    ce.by_our_action[ca] = ce.by_our_action[ca] or { situations = {} }
+    for _, key in ipairs({ skey, gkey }) do
+        local sb = ce.by_our_action[ca].situations[key] or { n = 0, responses = {} }
+        for ra, rc in pairs(sb.responses) do
+            local nv = rc * (ce.decay or 0.97)
+            if nv < 0.01 then sb.responses[ra] = nil else sb.responses[ra] = nv end
+        end
+        sb.n = (sb.n or 0) * (ce.decay or 0.97) + 1
+        sb.responses[action] = (sb.responses[action] or 0) + 1
+        ce.by_our_action[ca].situations[key] = sb
+    end
+
     local total = 0
     for _, c in pairs(self.player_model.long_term_counts) do total = total + c end
     self.player_model.confidence[action] = total > 0 and ((self.player_model.long_term_counts[action] or 0) / total) or 0
 
     local cm = self.player_model.conditioning_memory
+    cm.pressure_frames = ((observation.p_blockstun or 0) > 0 or (observation.p_hitstun or 0) > 0) and ((cm.pressure_frames or 0) + 1) or 0
     if action == "throw_tech" then cm.no_throw_tech_streak = 0 else cm.no_throw_tech_streak = cm.no_throw_tech_streak + 1 end
     if action == "jump_after_block_light" then cm.jump_after_block_light = cm.jump_after_block_light + 1 end
     if action == "block_after_light" then cm.block_light_trials = cm.block_light_trials + 1 end
@@ -2432,6 +2571,11 @@ function AI:_predictOpponentBranches(obs)
     end
     for _, b in ipairs(branches) do b.p = b.p * (gen_prior[b.action] or 1.0) end
 
+    for _, b in ipairs(branches) do
+        b.p = b.p * self:_situationActionPrior(obs, b.action)
+        b.p = b.p * self:_conditioningResponseBias(obs, b.action)
+    end
+
     local sum2 = 0
     for _, b in ipairs(branches) do sum2 = sum2 + b.p end
     for _, b in ipairs(branches) do b.p = b.p / math.max(sum2, 1e-6) end
@@ -2447,7 +2591,7 @@ function AI:_predictOpponentBranches(obs)
     for _, b in ipairs(branches) do b.p = b.p / math.max(sum3, 1e-6) end
 
     local conf = clamp(0.2 + 0.6 * (self.belief.confidence or 0.5) + 0.2 * hconf, 0.1, 0.98)
-    return branches, { confidence = conf, reason = "genbr_persona_bayes_humanpolicy", persona = persona, human_confidence = hconf }
+    return branches, { confidence = conf, reason = "genbr_persona_bayes_humanpolicy_situation_conditioning", persona = persona, human_confidence = hconf }
 end
 
 function AI:_isLosingPosition(state, action, horizon)
@@ -3040,12 +3184,109 @@ function AI:_runStrategyTournament()
     self.logs.tournaments[#self.logs.tournaments + 1] = { frame = self.frame, winner = winner, score = score }
 end
 
+function AI:_isCriticalState(obs)
+    local hp_gap = math.abs((obs.p_health or 100) - (obs.o_health or 100))
+    local low_hp = (obs.p_health or 100) <= 26 or (obs.o_health or 100) <= 26
+    local stun = ((obs.p_hitstun or 0) + (obs.p_blockstun or 0) + (obs.o_hitstun or 0) + (obs.o_blockstun or 0)) > 0
+    local volatile = self:_volatilityScore(obs) > 8
+    return low_hp or hp_gap >= 35 or stun or volatile
+end
+
+function AI:_metaGameplanSelector(obs)
+    local style = self.player_model.style or {}
+    local uncertainty = self.belief.uncertainty or 0.5
+    local plan = "balanced_long_horizon"
+    local risk = self.config.risk_tolerance
+
+    if uncertainty > 0.62 and self.timescale.round_clock < 240 then
+        plan = "data_gathering"
+    elseif (style.backdash_frequency or 0) > 0.58 then
+        plan = "adaptive_pressure"
+        risk = risk + 0.08
+    elseif (style.mash_spike or 0) > 0.22 or (style.panic_reversal or 0) > 0.2 then
+        plan = "control_over_damage"
+        risk = risk - 0.06
+    elseif (style.aggression or 0.5) > 0.64 then
+        plan = "low_variance_closeout"
+        risk = risk - 0.04
+    end
+
+    self.timescale.match_plan = plan
+    self.config.risk_tolerance = clamp(risk, 0.2, 0.85)
+    return { plan = plan, risk = self.config.risk_tolerance, uncertainty = uncertainty }
+end
+
+function AI:_probeAction(obs)
+    if self.timescale.match_plan ~= "data_gathering" then return nil end
+    if (self.belief.uncertainty or 0.5) < 0.5 then return nil end
+    local dist = math.abs((obs.px or 0) - (obs.ox or 0))
+    if dist > 140 then return "walk_fwd" end
+    if (obs.o_meter or 0) < GAME_CONSTANTS.SPECIAL_FLUX_COST then return "light" end
+    return "block"
+end
+
+function AI:_distilledPolicyAction(obs)
+    local key = self:_hashState(self:_initSimState(obs))
+    local row = self.distilled_policy.table[key]
+    if not row then return nil, 0 end
+    local total = 0
+    for _, c in pairs(row) do total = total + c end
+    if total <= 0 then return nil, 0 end
+
+    local best, bv = nil, -1
+    for a, c in pairs(row) do
+        if c > bv then best, bv = a, c end
+    end
+    local conf = bv / math.max(1e-6, total)
+    return best, conf
+end
+
+function AI:_updateDistilledPolicy(obs, top)
+    local key = self:_hashState(self:_initSimState(obs))
+    self.distilled_policy.table[key] = self.distilled_policy.table[key] or {}
+    self.distilled_policy.visits[key] = (self.distilled_policy.visits[key] or 0) + 1
+    local row = self.distilled_policy.table[key]
+
+    if type(top) == "table" and #top > 0 and type(top[1]) == "table" then
+        for _, t in ipairs(top) do
+            local a = t.action
+            local v = math.max(0, tonumber(t.visits or t.p or 0) or 0)
+            if a then row[a] = (row[a] or 0) + v end
+        end
+    elseif type(top) == "table" and top[1] then
+        row[top[1]] = (row[top[1]] or 0) + 1
+    end
+
+    if self.frame % 120 == 0 then
+        for k, rr in pairs(self.distilled_policy.table) do
+            for a, c in pairs(rr) do
+                local nv = c * 0.995
+                if nv < 0.01 then rr[a] = nil else rr[a] = nv end
+            end
+            if next(rr) == nil then self.distilled_policy.table[k] = nil end
+        end
+    end
+
+    local n=0
+    for _ in pairs(self.distilled_policy.table) do n=n+1 end
+    self.distilled_policy.confidence = clamp(0.2 + 0.8 * math.min(1, n / 500), 0, 1)
+end
+
+function AI:_nashAnchorBias(action)
+    local na = self.league.nash_anchor or {}
+    local priors = na.priors or {}
+    local conf = clamp(na.confidence or 0.25, 0, 1)
+    local p = priors[action] or 0.08
+    return (1 - 0.35 * conf) + (0.35 * conf) * (0.5 + p)
+end
+
 function AI:_planAction(obs, layer_state)
     if not self.config.ablations.search then
         return "light", { score = 0, reason = "search_ablation", top = { "light" } }
     end
 
     self:_conditionOpponentModel(obs)
+    local pre_meta = self:_metaGameplanSelector(obs)
     local volatility = self:_volatilityScore(obs)
     local cached = self:_cachedInstinct(obs)
     local epi_mode = self:_epistemicMode()
@@ -3061,8 +3302,16 @@ function AI:_planAction(obs, layer_state)
         return "walk_back", { score = 0, reason = "graceful_degradation_buy_time", top = { "walk_back", "block" }, action_confidence = 0.6, volatility = volatility, epistemic_mode = epi_mode }
     end
 
+    local probe = self:_probeAction(obs)
+    if probe then return probe, { score = 0, reason = "uncertainty_probe", top = { probe }, strategic_probe = true, pre_meta = pre_meta } end
+
+    local distilled_action, distilled_conf = self:_distilledPolicyAction(obs)
+    if distilled_action and distilled_conf > 0.62 and not self:_isCriticalState(obs) then
+        return distilled_action, { score = 0, reason = "distilled_policy_fastpath", top = { distilled_action }, action_confidence = distilled_conf, volatility = volatility, epistemic_mode = epi_mode, pre_meta = pre_meta }
+    end
+
     local book = self:_openingBookAction(obs)
-    if book then return book, { score = 0, reason = "opening_book", top = { book } } end
+    if book then return book, { score = 0, reason = "opening_book", top = { book }, pre_meta = pre_meta } end
 
     local root = self:_initSimState(obs)
     local counter_style = self:_synthesizeCounterStyle()
@@ -3105,6 +3354,14 @@ function AI:_planAction(obs, layer_state)
     end
     if taunt_hint then best_action = taunt_hint end
     if live_meta_bias and (self.frame % 90) < 18 then best_action = live_meta_bias end
+
+    if type(top) == "table" and #top > 0 and type(top[1]) == "table" then
+        for _, row in ipairs(top) do
+            row.q = (row.q or 0) * self:_nashAnchorBias(row.action)
+        end
+        table.sort(top, function(a, b) return (a.q or -1e9) > (b.q or -1e9) end)
+        best_action = top[1] and top[1].action or best_action
+    end
 
     if self:_isStrategyRetired(best_action) then
         best_action = "block"
@@ -3154,7 +3411,9 @@ function AI:_planAction(obs, layer_state)
         epistemic_mode = epi_mode,
         tilt_cascade = cascade,
         taunt_hint = taunt_hint,
-        live_meta = deepcopy(self.live_meta.counter_bias or {})
+        live_meta = deepcopy(self.live_meta.counter_bias or {}),
+        pre_meta = pre_meta,
+        distilled_confidence = distilled_conf or 0
     }
 end
 
@@ -3174,7 +3433,32 @@ function AI:_counterfactuals(state)
     local d = self:_rolloutState(self:_initSimState(state), "light", "walk_back", 6)
     local s1 = self:evaluateState(b)
     local s2 = self:evaluateState(d)
-    return { if_opponent_blocks = s1, if_opponent_disengages = s2, delta = s1 - s2 }
+
+    local block_p, disengage_p = 0.5, 0.5
+    local branches = self:_predictOpponentBranches(state)
+    if type(branches) == "table" then
+        for _, branch in ipairs(branches) do
+            if branch.action == "block" then block_p = math.max(0, branch.p or 0) end
+            if branch.action == "walk_back" then disengage_p = math.max(0, branch.p or 0) end
+        end
+    end
+
+    local normalizer = block_p + disengage_p
+    if normalizer > 1e-6 then
+        block_p = block_p / normalizer
+        disengage_p = disengage_p / normalizer
+    else
+        block_p, disengage_p = 0.5, 0.5
+    end
+
+    local weighted = block_p * s1 + disengage_p * s2
+    return {
+        if_opponent_blocks = s1,
+        if_opponent_disengages = s2,
+        delta = s1 - s2,
+        counterfactual_weights = { block = block_p, walk_back = disengage_p },
+        weighted_expected_value = weighted
+    }
 end
 
 function AI:_applyMotorNoise(action)
@@ -3411,6 +3695,7 @@ function AI:_logDecision(obs, action, meta)
     self.logs.eval_scores[#self.logs.eval_scores + 1] = score
     self.logs.eval_breakdown[#self.logs.eval_breakdown + 1] = breakdown
     self.logs.top_actions[#self.logs.top_actions + 1] = deepcopy(meta.top or { action })
+    self:_updateDistilledPolicy(obs, meta.top or { action })
     self.logs.prediction[#self.logs.prediction + 1] = {
         confidence = meta.prediction_confidence or 0,
         reason = meta.prediction_reason or "n/a",
@@ -3582,12 +3867,22 @@ function AI:runSelfPlayLeague(total_games, opts)
     local cfg = opts or {}
     local games = math.max(1, total_games or 10000)
     if #self.league.snapshots == 0 then
-        self:recordLeagueSnapshot("baseline_fsm", 1300)
-        self:recordLeagueSnapshot("aggressive_bot", 1450)
-        self:recordLeagueSnapshot("defensive_bot", 1450)
-        self.league.personas["baseline_fsm"] = "balanced"
-        self.league.personas["aggressive_bot"] = "aggressive"
-        self.league.personas["defensive_bot"] = "defensive"
+        local seeds = {
+            { id = "baseline_fsm", elo = 1300, persona = "balanced" },
+            { id = "aggressive_bot", elo = 1450, persona = "aggressive" },
+            { id = "defensive_bot", elo = 1450, persona = "defensive" },
+            { id = "grappler_bias", elo = 1420, persona = "aggressive" },
+            { id = "zoner_bias", elo = 1420, persona = "defensive" },
+            { id = "randomizer_bot", elo = 1360, persona = "balanced" },
+            { id = "anti_adaptation_bot", elo = 1460, persona = "balanced" },
+            { id = "sandbag_bot", elo = 1340, persona = "balanced" }
+        }
+        for _, seed in ipairs(seeds) do
+            self:recordLeagueSnapshot(seed.id, seed.elo)
+            self.league.personas[seed.id] = seed.persona
+            local pop = self.league.populations[(seed.id:gsub("_bot", ""))] or self.league.populations[seed.persona] or self.league.populations.balanced
+            if pop then pop[#pop + 1] = seed.id end
+        end
     end
 
     local rng = make_rng(self.config.seed + self.league.games_played)
@@ -3600,7 +3895,15 @@ function AI:runSelfPlayLeague(total_games, opts)
         local obs = self:_observeState()
         local root = self:_initSimState(obs)
         local act_self = self.last_action or "light"
-        local act_opp = (persona == "aggressive") and "heavy" or ((persona == "defensive") and "block" or "light")
+        local act_opp = "light"
+        if opp == "grappler_bias" then act_opp = "throw"
+        elseif opp == "zoner_bias" then act_opp = "walk_back"
+        elseif opp == "randomizer_bot" then act_opp = ACTIONS[math.floor(rng() * #ACTIONS) + 1]
+        elseif opp == "anti_adaptation_bot" then act_opp = ((self.last_action == "throw") and "jump" or "block")
+        elseif opp == "sandbag_bot" then act_opp = ((rng() < 0.35) and "idle" or "block")
+        elseif persona == "aggressive" then act_opp = "heavy"
+        elseif persona == "defensive" then act_opp = "block"
+        end
         local end_state = self:_rolloutState(root, act_self, act_opp, cfg.frames or 10)
 
         local reward = ((end_state.o_health or 0) - (end_state.p_health or 0)) / 100
@@ -3667,6 +3970,15 @@ function AI:recordLeagueResult(opponent_id, reward)
     opp_elo = opp_elo + k * ((1 - outcome) - (1 - exp))
     self.league.elo["current"] = self_elo
     self.league.elo[opponent_id] = opp_elo
+
+    local na = self.league.nash_anchor or { priors = {}, confidence = 0.25 }
+    local a = self.last_action or "idle"
+    na.priors[a] = clamp(0.995 * (na.priors[a] or 0.1) + 0.005 * ((reward or 0) > 0 and 1 or 0.05), 0.01, 0.6)
+    local z = 0
+    for _, v in pairs(na.priors) do z = z + v end
+    if z > 1e-6 then for k, v in pairs(na.priors) do na.priors[k] = v / z end end
+    na.confidence = clamp(0.995 * (na.confidence or 0.25) + 0.005 * clamp(math.abs(reward or 0), 0, 1), 0.15, 0.95)
+    self.league.nash_anchor = na
 
     self:updateCurriculum()
 end
