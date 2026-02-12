@@ -287,6 +287,14 @@ local ROLE = {
     BALANCED = "Balanced"
 }
 
+local function has_tag(list, tag)
+    if type(list) ~= "table" then return false end
+    for _, v in ipairs(list) do
+        if v == tag then return true end
+    end
+    return false
+end
+
 local function clamp(value, min_v, max_v)
     if value < min_v then return min_v end
     if value > max_v then return max_v end
@@ -662,6 +670,14 @@ function StratAI:score_colonization(planet)
 end
 
 function StratAI:should_colonize(planet)
+    if (self.config.expansion or {}).enabled == true then
+        local max_planets = safe_number((self.config.expansion or {}).max_planets, 999)
+        local current_planets = safe_number((self.last_eval or {}).planet_count, 0)
+        if current_planets >= max_planets then
+            return false, "Expansion cap reached"
+        end
+    end
+
     local habitability = safe_number(planet.habitability, 0)
     local size = safe_number(planet.size, 0)
     local is_special = (planet.special_type ~= nil and planet.special_type ~= "")
@@ -693,7 +709,7 @@ function StratAI:assign_planet_role(planet)
         return planet.restore_ready and ROLE.ECU_CANDIDATE or ROLE.RESEARCH
     end
 
-    if planet.special_type == "ecumenopolis" then
+    if planet.special_type == "ecumenopolis" or planet.is_ecumenopolis == true then
         return ROLE.INDUSTRIAL
     end
 
@@ -703,7 +719,7 @@ function StratAI:assign_planet_role(planet)
 
     local max_cap = math.max(gen_cap, min_cap, agri_cap)
 
-    if size >= 20 and max_cap >= 8 then return ROLE.INDUSTRIAL end
+    if size >= 20 and (max_cap >= 8 or alloy_deposits >= 2) then return ROLE.INDUSTRIAL end
     if gen_cap == max_cap and gen_cap >= 5 then return ROLE.GENERATOR end
     if min_cap == max_cap and min_cap >= 5 then return ROLE.MINING end
     if agri_cap == max_cap and agri_cap >= 5 then return ROLE.AGRI end
@@ -1235,6 +1251,9 @@ function StratAI:score_economy(state)
 
     local capacity_pp = safe_number(state.unused_district_capacity, 0) / planets
     local pop_eff = safe_number(state.pop_efficiency, 0)
+    local trade_upkeep = safe_number(state.trade_upkeep_pressure, safe_number(state.trade_maintenance_ratio, 0))
+    local housing_pressure = normalize_ratio(state.housing_pressure)
+    local amenities_pressure = normalize_ratio(state.amenities_pressure)
 
     local base =
         logistic_like(energy_pp, 2.5) * 0.18 +
@@ -1251,11 +1270,16 @@ function StratAI:score_economy(state)
         deficit_penalty(alloys_pp) * 0.35 +
         deficit_penalty(cg_pp) * 0.75
 
+    local predictive_penalty =
+        logistic_like(trade_upkeep, 1.0) * 0.14 +
+        logistic_like(housing_pressure, 1.0) * 0.10 +
+        logistic_like(amenities_pressure, 1.0) * 0.10
+
     if self.galaxy_meta.crisis_phase ~= "none" then
         penalty = penalty * (1.0 - self.config.crisis_deficit_tolerance)
     end
 
-    return clamp(base - penalty, -3.0, 3.0)
+    return clamp(base - penalty - predictive_penalty, -3.0, 3.0)
 end
 
 function StratAI:score_military(state)
@@ -1289,7 +1313,9 @@ function StratAI:score_military(state)
         mix_score -
         enemy_counter_risk * 0.15 -
         reinforcement_penalty -
-        econ_penalty
+        econ_penalty -
+        army_penalty +
+        split_bonus
 
     return clamp(score, -3.0, 3.0)
 end
@@ -2392,6 +2418,106 @@ function StratAI:explain_eval_snapshot(state)
         counter_meta = self.active_counter_meta and self.active_counter_meta.our_strategy_name or "none",
         opponent_detected = self.active_counter_meta and "Meta spammer countered" or "No counter needed"
     }
+    self.eval_component_log[#self.eval_component_log + 1] = snapshot
+    while #self.eval_component_log > max_log do
+        table.remove(self.eval_component_log, 1)
+    end
+    return snapshot
+end
+
+function StratAI:_fleet_mix_score(state)
+    local f = state.fleet_mix or {}
+    local bs = normalize_ratio(f.battleship or state.ship_class_battleship or 0)
+    local cv = normalize_ratio(f.corvette or state.ship_class_corvette or 0)
+    local ratio_cap = normalize_ratio(((self.config.fleet or {}).max_battleship_ratio) or 0.35)
+    local min_corvette = normalize_ratio(((self.config.fleet or {}).min_corvette_ratio) or 0.20)
+
+    local spam_penalty = math.max(0, bs - ratio_cap) * 1.6
+    local low_screen_penalty = math.max(0, min_corvette - cv) * 1.1
+    local corvette_bloat_penalty = math.max(0, cv - 0.75) * 0.8
+    local adaptive_bonus = 0
+    if self.active_counter_meta and self.active_counter_meta.our_strategy_name == "tracking_battleship_wall" then
+        adaptive_bonus = adaptive_bonus + 0.08
+    elseif self.active_counter_meta and self.active_counter_meta.our_strategy_name == "pd_corvette_swarm" then
+        adaptive_bonus = adaptive_bonus + 0.10
+    end
+
+    return clamp(adaptive_bonus - spam_penalty - low_screen_penalty - corvette_bloat_penalty, -0.75, 0.25)
+end
+
+function StratAI:_eco_gap_multiplier(state)
+    local enemy = math.max(1, safe_number(state.enemy_total_economy, 0))
+    local ours = math.max(1, safe_number(state.our_total_economy, 0))
+    local ratio = enemy / ours
+    if ratio >= 5.0 then return 1.35, ratio end
+    if ratio >= 3.0 then return 1.20, ratio end
+    return 1.0, ratio
+end
+
+function StratAI:build_dynamic_meta_templates(state)
+    local out = {}
+    local templates = state.dynamic_meta_templates or {}
+    for _, t in ipairs(templates) do
+        if t and t.strategy_name and t.signature_conditions then
+            out[#out + 1] = t
+        end
+    end
+
+    local steam = state.steam_meta_signals or {}
+    if steam.bio_rush_confidence and steam.bio_rush_confidence > 0.6 then
+        out[#out + 1] = {
+            phase = "any",
+            signature_conditions = { game_year_min = 2230, bio_ascension = true },
+            strategy_name = "steam_bio_rush_counterfeed",
+            weight_modifiers = { Mil = 1.35, Eco = 1.10, Tech = 0.95 },
+            confidence = clamp(safe_number(steam.bio_rush_confidence, 0.65), 0.5, 0.95)
+        }
+    end
+    if steam.virtuality_confidence and steam.virtuality_confidence > 0.6 then
+        out[#out + 1] = {
+            phase = "any",
+            signature_conditions = { game_year_min = 2235, machine_age_virtuality = true },
+            strategy_name = "steam_virtuality_denial_feed",
+            weight_modifiers = { Mil = 1.25, Tech = 1.15, Pos = 1.10 },
+            confidence = clamp(safe_number(steam.virtuality_confidence, 0.65), 0.5, 0.95)
+        }
+    end
+
+    return out
+end
+
+function StratAI:_action_matches_pattern(action, pattern)
+    if not action or not pattern then return false end
+    local key = (action.type or "") .. "_" .. (action.target or "")
+    local p = tostring(pattern):gsub("%+", "")
+    return key:find(p, 1, true) ~= nil
+end
+
+function StratAI:_apply_weight_blend(score, action, mods, blend)
+    local m = mods or {}
+    local b = clamp(safe_number(blend, 0), 0, 1)
+    local mul = 1.0
+    if action.type == "declare_war" or action.type == "containment_front" then mul = mul + b * ((m.Mil or 1) - 1) end
+    if action.type == "research" or action.type == "tech_denial" then mul = mul + b * ((m.Tech or 1) - 1) end
+    if action.type == "build" or action.type == "delay_stockpile" then mul = mul + b * ((m.Eco or 1) - 1) end
+    if action.type == "seal_borders" or action.type == "fortify_chokepoint" then mul = mul + b * ((m.Pos or 1) - 1) end
+    if action.type == "hold_line_primary" or action.type == "hold_line_secondary" then mul = mul + b * ((m.Stab or 1) - 1) end
+    return score * clamp(mul, 0.7, 1.8)
+end
+
+function StratAI:_update_meta_effectiveness(meta_name, counter_name, score)
+    if meta_name and meta_name ~= "none" then
+        local b = self.meta_effectiveness.by_meta
+        b[meta_name] = b[meta_name] or { n = 0, reward = 0 }
+        b[meta_name].n = b[meta_name].n + 1
+        b[meta_name].reward = 0.97 * b[meta_name].reward + 0.03 * safe_number(score, 0)
+    end
+    if counter_name and counter_name ~= "none" then
+        local b = self.meta_effectiveness.by_counter
+        b[counter_name] = b[counter_name] or { n = 0, reward = 0 }
+        b[counter_name].n = b[counter_name].n + 1
+        b[counter_name].reward = 0.97 * b[counter_name].reward + 0.03 * safe_number(score, 0)
+    end
 end
 
 function StratAI:campaign_templates()
