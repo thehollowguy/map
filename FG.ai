@@ -1,0 +1,4078 @@
+-- Research-Grade Fighting Game AI (Hybrid Search-Ready, Frame-Accurate Scaffold)
+
+local AI = {}
+AI.__index = AI
+
+local ACTIONS = { "idle", "walk_fwd", "walk_back", "jump", "block", "light", "heavy", "throw", "special" }
+
+local GAME_CONSTANTS = {
+    BLOCK_SIZE = 16,
+    GRAVITY = 0.42,
+    WALK_ACCEL = 0.75,
+    GROUND_FRICTION = 0.84,
+    FULL_JUMP_VEL = -10.2,
+    FLUX_CAP = 100,
+    FLUX_ON_HIT = 5,
+    FLUX_ON_COUNTER = 10,
+    ATTACK_RANGE_W = 16 * 1.8,
+    ATTACK_RANGE_H = 16 * 2.2,
+    SHIELD_HIT_DECAY = 2.2,
+    SHIELD_CHIP = 0.25,
+    SHIELD_PUSH = 0.3,
+    ANTIQUITY_FLUX_COST = 20,
+    SPECIAL_FLUX_COST = 20,
+    SCREEN_W = 800,
+    PLATFORM_Y = 420,
+    CHAR_HEIGHT = 32,
+    THROW_TECH_WINDOW = 5
+}
+
+local MACRO_ACTIONS = {
+    safe_poke = { "walk_fwd", "light" },
+    dash_throw = { "walk_fwd", "walk_fwd", "throw" },
+    frame_trap = { "light", "light", "heavy" },
+    safe_jump = { "jump", "block", "light" },
+    meaty_throw = { "walk_fwd", "throw" }
+}
+
+local FRAME_DATA = {
+    idle = {
+        startup = 0, active = 0, recovery = 0, on_hit = 0, on_block = 0, damage = 0,
+        chip = 0, guard_crush = 0, meter_gain_hit = 0, meter_gain_block = 0, invuln = 0,
+        throw = false, anti_air = false, proximity_guard = false, pushback_on_hit = 0, pushback_on_block = 0,
+        hitboxes = {}, air_ok = true, ground_ok = true, cancel = {}
+    },
+    walk_fwd = { startup = 0, active = 0, recovery = 0, on_hit = 0, on_block = 0, damage = 0, chip = 0, guard_crush = 0, meter_gain_hit = 0, meter_gain_block = 0, invuln = 0, throw = false, anti_air = false, proximity_guard = true, pushback_on_hit = 0, pushback_on_block = 0, hitboxes = {}, air_ok = false, ground_ok = true, cancel = {} },
+    walk_back = { startup = 0, active = 0, recovery = 0, on_hit = 0, on_block = 0, damage = 0, chip = 0, guard_crush = 0, meter_gain_hit = 0, meter_gain_block = 0, invuln = 0, throw = false, anti_air = false, proximity_guard = true, pushback_on_hit = 0, pushback_on_block = 0, hitboxes = {}, air_ok = false, ground_ok = true, cancel = {} },
+    jump = { startup = 2, active = 16, recovery = 2, on_hit = 0, on_block = 0, damage = 0, chip = 0, guard_crush = 0, meter_gain_hit = 0, meter_gain_block = 0, invuln = 0, throw = false, anti_air = false, proximity_guard = false, pushback_on_hit = 0, pushback_on_block = 0, hitboxes = {}, air_ok = true, ground_ok = true, cancel = {} },
+    block = { startup = 1, active = 1, recovery = 1, on_hit = 0, on_block = 0, damage = 0, chip = 0, guard_crush = 0, meter_gain_hit = 0, meter_gain_block = 0, invuln = 0, throw = false, anti_air = false, proximity_guard = true, pushback_on_hit = 0, pushback_on_block = 0, hitboxes = {}, air_ok = false, ground_ok = true, cancel = {} },
+    light = {
+        startup = 4, active = 3, recovery = 8, on_hit = 10, on_block = -2, damage = 7, chip = 0.5, guard_crush = 1,
+        meter_gain_hit = GAME_CONSTANTS.FLUX_ON_HIT, meter_gain_block = 3, invuln = 0, throw = false, anti_air = true,
+        proximity_guard = true, pushback_on_hit = 4.0, pushback_on_block = 2.2, air_ok = true, ground_ok = true,
+        hitboxes = { { frame = 5, w = 26, h = 18, y = -8 }, { frame = 6, w = 24, h = 18, y = -8 }, { frame = 7, w = 22, h = 18, y = -8 } },
+        cancel = { light = { 6, 7 }, heavy = { 7 }, special = { 6, 7, 8 }, throw = { 7 } }
+    },
+    heavy = {
+        startup = 12, active = 3, recovery = 18, on_hit = 16, on_block = -8, damage = 14, chip = 1.5, guard_crush = 3,
+        meter_gain_hit = GAME_CONSTANTS.FLUX_ON_HIT + 2, meter_gain_block = 4, invuln = 0, throw = false, anti_air = false,
+        proximity_guard = true, pushback_on_hit = 7.2, pushback_on_block = 3.8, air_ok = false, ground_ok = true,
+        hitboxes = { { frame = 13, w = 30, h = 20, y = -10 }, { frame = 14, w = 32, h = 20, y = -10 }, { frame = 15, w = 28, h = 18, y = -10 } },
+        cancel = { special = { 14, 15 }, jump = { 15 } }
+    },
+    throw = {
+        startup = 5, active = 2, recovery = 18, on_hit = 20, on_block = -999, damage = 8, chip = 0, guard_crush = 0,
+        meter_gain_hit = GAME_CONSTANTS.FLUX_ON_HIT, meter_gain_block = 0, invuln = 0, throw = true, anti_air = false,
+        proximity_guard = false, pushback_on_hit = 2.0, pushback_on_block = 0, hitboxes = { { frame = 6, w = 18, h = 24, y = -8 }, { frame = 7, w = 18, h = 24, y = -8 } },
+        air_ok = false, ground_ok = true, cancel = {}
+    },
+    special = {
+        startup = 9, active = 5, recovery = 20, on_hit = 18, on_block = -4, damage = 12, chip = 2.5, guard_crush = 4,
+        meter_gain_hit = 0, meter_gain_block = 0, invuln = 2, throw = false, anti_air = false, projectile = true,
+        proximity_guard = true, pushback_on_hit = 8.0, pushback_on_block = 4.2, hitboxes = { { frame = 10, w = 38, h = 20, y = -10 }, { frame = 11, w = 40, h = 20, y = -10 }, { frame = 12, w = 36, h = 20, y = -10 }, { frame = 13, w = 30, h = 18, y = -10 }, { frame = 14, w = 28, h = 18, y = -10 } },
+        air_ok = true, ground_ok = true, cancel = {}
+    }
+}
+
+local DEFAULT_CONFIG = {
+    seed = 1337,
+    fixed_dt = 1 / 60,
+    max_rollout_depth = 8,
+    max_branching = 8,
+    decision_budget_ms = 3.5,
+    emergency_budget_ms = 1.0,
+    reaction_delay_frames = 8,
+    observation_noise = 0.02,
+    difficulty = 0.5,
+    risk_tolerance = 0.5,
+    quiescence_depth = 12,
+
+    fairness_sliders = {
+        reaction_limit = 0.75,
+        information_parity = 1.0,
+        execution_error = 0.08,
+        input_buffer_leniency = 0.5
+    },
+
+    phase_weights = {
+        neutral = 1.0,
+        pressure = 1.1,
+        wakeup = 1.15,
+        scramble = 0.95
+    },
+
+    phase_policy = {
+        neutral = { depth = 12, branching = 10, pruning_bias = 1.0, eval_scale = 1.0 },
+        advantage = { depth = 11, branching = 8, pruning_bias = 0.9, eval_scale = 1.1 },
+        disadvantage = { depth = 9, branching = 8, pruning_bias = 0.8, eval_scale = 0.95 },
+        knockdown = { depth = 20, branching = 6, pruning_bias = 0.85, eval_scale = 1.15 },
+        scramble = { depth = 8, branching = 7, pruning_bias = 1.2, eval_scale = 0.9 },
+        kill_range = { depth = 25, branching = 4, pruning_bias = 0.75, eval_scale = 1.25 },
+        time_pressure = { depth = 10, branching = 8, pruning_bias = 0.85, eval_scale = 1.05 }
+    },
+
+    eval_weights = {
+        frame_advantage = 0.7,
+        corner_pressure = 0.9,
+        resource_availability = 0.25,
+        initiative = 0.5,
+        recovery_lock = -0.4,
+        threat_count = 0.65,
+        health_diff = 1.0,
+        risk_exposure = -0.35,
+        neutral_control = 0.55,
+        frame_trap_potential = 0.65,
+        throw_threat = 0.45,
+        anti_air_readiness = 0.5
+    },
+
+    hybrid = {
+        enabled = true,
+        search_weight = 0.75,
+        critic_enabled = false
+    },
+
+    learned_critic = {
+        enabled = true,
+        blend = 0.4,
+        input_dim = 20,
+        hidden_dim = 64,
+        learning_rate = 0.0005
+    },
+
+    mcts = {
+        enabled = true,
+        simulations = 1024,
+        c_puct = 1.8,
+        rollout_frames = 8,
+        temperature = 0.0,
+        progressive_widening = true,
+        widening_exponent = 1.2,
+        widening_base = 2,
+        forced_playouts = 10,
+        virtual_loss = 2.0,
+        root_reuse_decay = 0.99,
+        rollout_cache_size = 1500,
+        temperature_min = 0.0,
+        temperature_decay = 0.995
+    },
+
+    world_model = {
+        enabled = true,
+        horizon_frames = 24,
+        use_for_search = true,
+        uncertainty_mix = 0.35,
+        feature_dim = 20
+    },
+
+    muzero = {
+        enabled = true,
+        latent_dim = 16,
+        unroll_steps = 8,
+        value_blend = 0.35,
+        policy_blend = 0.25,
+        dirichlet_alpha = 0.3,
+        dirichlet_eps = 0.25,
+        replay_size = 12000,
+        learning_rate = 0.0007
+    },
+
+    self_improvement = {
+        regret_trigger = 8,
+        volatility_trigger = 10,
+        solved_cache_min_visits = 8,
+        solved_cache_score_band = 5,
+        rollback_eval_drop = 12
+    },
+
+    ablations = {
+        prediction = true,
+        learning = true,
+        player_model = true,
+        search = true,
+        uncertainty = true,
+        transposition = true,
+        quiescence = true,
+        move_ordering = true,
+        pruning = true,
+        belief_reasoning = true,
+        info_theory = true,
+        deception = true,
+        novelty = true,
+        explainability = true,
+        human_believability = true
+    }
+}
+
+local function deepcopy(tbl)
+    if type(tbl) ~= "table" then return tbl end
+    local out = {}
+    for k, v in pairs(tbl) do out[k] = deepcopy(v) end
+    return out
+end
+
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+local function softmax_map(scores, temperature)
+    local t = math.max(1e-6, temperature or 1.0)
+    local max_s = -1e9
+    for _, v in pairs(scores or {}) do if v > max_s then max_s = v end end
+    local out, denom = {}, 0
+    for k, v in pairs(scores or {}) do
+        local e = math.exp(((v or 0) - max_s) / t)
+        out[k] = e
+        denom = denom + e
+    end
+    if denom <= 0 then return out end
+    for k, v in pairs(out) do out[k] = v / denom end
+    return out
+end
+
+local function grad_clip(v, lim)
+    local l = lim or 1.5
+    if v > l then return l end
+    if v < -l then return -l end
+    return v
+end
+
+local function now_ms()
+    if love and love.timer and love.timer.getTime then
+        return love.timer.getTime() * 1000
+    end
+    return os.clock() * 1000
+end
+
+local function make_rng(seed)
+    local state = seed or 1337
+    return function()
+        state = (1103515245 * state + 12345) % 2147483648
+        return state / 2147483648
+    end
+end
+
+local function _zkey(rng)
+    return math.floor(rng() * 2147483647)
+end
+
+local function init_zobrist(rng)
+    local z = { buckets = {}, hp = {}, meter = {}, move = {}, stun = {} }
+    for i = 1, 220 do z.buckets[i] = _zkey(rng) end
+    for i = 1, 40 do z.hp[i] = _zkey(rng) end
+    for i = 1, 20 do z.meter[i] = _zkey(rng) end
+    for i = 1, 64 do z.stun[i] = _zkey(rng) end
+    for i, a in ipairs(ACTIONS) do z.move[a] = _zkey(rng) + i * 97 end
+    return z
+end
+
+local function new_char(x, y, health, meter)
+    return {
+        x = x or 0,
+        y = y or 0,
+        vy = 0,
+        airborne = false,
+        health = clamp(health or 100, 0, 100),
+        meter = clamp(meter or 0, 0, 100),
+        isBlocking = false,
+        hitstun = 0,
+        blockstun = 0,
+        current_move = "idle",
+        frame_in_move = 0,
+        move_done = true,
+        frame_advantage = 0,
+        throw_tech_window = 0
+    }
+end
+
+function AI:new(player, opponent, config)
+    local self = setmetatable({}, AI)
+    self.config = deepcopy(DEFAULT_CONFIG)
+    if config then
+        for k, v in pairs(config) do
+            if type(v) == "table" and type(self.config[k]) == "table" then
+                for kk, vv in pairs(v) do self.config[k][kk] = vv end
+            else
+                self.config[k] = v
+            end
+        end
+    end
+
+    self.player = player
+    self.opponent = opponent
+    self.rng = make_rng(self.config.seed)
+    self.zobrist = init_zobrist(self.rng)
+    self.frame = 0
+    self.last_action = "idle"
+    self.reaction_buffer = {}
+
+    self.player_model = {
+        short_term_window = {},
+        long_term_counts = {},
+        conditional = {},
+        confidence = {},
+        style = {
+            aggression = 0.5,
+            tech_rate = 0.5,
+            reversal_rate = 0.5,
+            backdash_frequency = 0.5,
+            mash_spike = 0.0,
+            panic_reversal = 0.0,
+            tilt_level = 0.0
+        },
+        conditioning_memory = {
+            no_throw_tech_streak = 0,
+            jump_after_block_light = 0,
+            block_light_trials = 0,
+            personalized_bait_timing = 6
+        }
+    }
+
+    self.human_policy = {
+        frame_perfect_timing = {},
+        habit_chains = {},
+        tilt_patterns = {},
+        conditioning = {
+            shielded_3x = false,
+            jumped_2x = false,
+            mashed_after_loss = false
+        },
+        windows = { actions = {}, timings = {} },
+        deception_state = { fake_repeat = 0, bait_arm = false },
+        confidence = 0.0
+    }
+
+    self.belief = {
+        opponent_belief = { expects_anti_air = 0.5, expects_block = 0.5, expects_throw = 0.5 },
+        opponent_model_of_us = { expects_patience = 0.5, expects_throw = 0.5 },
+        state_estimate = { px = 0, ox = 0, p_health = 100, o_health = 100 },
+        confidence = 0.5,
+        respect_decay = 0.0,
+        perceived_threat = 0.5,
+        feint_trials = 0,
+        feint_punishes = 0,
+        accuracy = 0.5,
+        overconfidence = 0.0,
+        uncertainty = 0.5,
+        certainty_spike = 0,
+        bayes = {
+            jump_after_block_light = { alpha = 1, beta = 1 },
+            panic_reversal = { alpha = 1, beta = 1 }
+        }
+    }
+
+    self.timescale = {
+        frame_clock = 0,
+        round_clock = 0,
+        match_clock = 0,
+        round_index = 1,
+        match_plan = "balanced_long_horizon"
+    }
+
+    self.transposition = {}
+    self.history_heuristic = {}
+    self.killer_moves = {}
+    self.rave_stats = {}
+    self.mcts_root_cache = nil
+    self.mcts_graph = {}
+    self.rollout_cache = {}
+    self.rollout_cache_order = {}
+    self.prev_root_score = 0
+
+
+    self.fairness = {
+        information_parity = true,
+        reaction_time_limit_frames = math.max(4, self.config.reaction_delay_frames),
+        no_hidden_state_access = true,
+        execution_error = self.config.fairness_sliders.execution_error,
+        input_buffer_leniency = self.config.fairness_sliders.input_buffer_leniency
+    }
+
+    self.opening_book = {
+        ["neutral|far"] = { "walk_fwd", "walk_fwd", "block" },
+        ["neutral|mid"] = { "walk_fwd", "light", "block" },
+        ["neutral|close"] = { "block", "light", "walk_back" }
+    }
+
+    self.cross_match_memory = {
+        opponent_fingerprints = {},
+        strategy_switch_after_rounds = 2,
+        misinformation_plan = { enabled = true, armed = false },
+        strategy_popularity = {},
+        adaptation_speed = {},
+        regret_memory = {}
+    }
+
+    self.dataset_priors = {
+        situations = { scramble = {}, wakeup = {}, corner_escape = {} },
+        action_frequencies = {},
+        timing_distributions = {},
+        risk_thresholds = {}
+    }
+
+    self.league = {
+        snapshots = {},
+        elo = {},
+        games_played = 0,
+        winrate = {},
+        personas = {},
+        helt = { aggressive = 0, defensive = 0, balanced = 0 }
+    }
+
+    self.meta_controller = {
+        opponent_bandit = {},
+        curriculum_stage = 1,
+        pfsp_temperature = 1.0,
+        selfplay_ratio = { mcts = 1, rl = 3 }
+    }
+
+    self.live_meta = {
+        enabled = false,
+        bracket_size = 0,
+        scout_delay = 300,
+        meta_update_interval = 900,
+        dominant_actions = {},
+        counter_bias = {},
+        last_update_frame = 0,
+        observed_matches = 0,
+        current_profile = "unknown"
+    }
+
+    self.psych_warfare = {
+        enabled = true,
+        taunt_cooldown = 0,
+        last_taunt = nil,
+        next_action_hint = nil,
+        taunt_count = 0
+    }
+
+    self.reaction_queue = {}
+    self.wakeup_memory = { timings = {}, bias = 0 }
+
+    self.state_classifier = {
+        last = "neutral",
+        confidence = 0.5
+    }
+
+    self.strategic = {
+        pace = "normal",
+        risk_tolerance = self.config.risk_tolerance,
+        win_condition = "resource_drain",
+        last_update_frame = 0
+    }
+
+    self.solved_cache = {}
+    self.phase_visit_count = {}
+    self.eval_versions = { { id = 1, weights = deepcopy(self.config.eval_weights), note = "init" } }
+    self.current_eval_version = 1
+    self.strategy_tournament = { snapshots = {}, standings = {}, last_winner = nil }
+    self.regression_guard = { baseline = nil, rollback_count = 0 }
+    self.benchmarks = { scenarios = {}, results = {}, total_matches = 0 }
+    self.rl = { steps = 0, epochs = 0, last_loss = 0, enabled = false }
+    self.world_model = nil
+    self.world_model_loaded = false
+    self.world_model_stats = { calls = 0, fallback = 0 }
+    self.muzero = nil
+    self.muzero_replay = {}
+    self.muzero_stats = { updates = 0, last_loss = 0 }
+    self.causal_trace = {}
+    self.opponent_shaping = { revealed_weakness = false, bait_window = 0, conditioned = 0 }
+
+    self.logs = {
+        trajectories = {},
+        decisions = {},
+        eval_scores = {},
+        eval_breakdown = {},
+        top_actions = {},
+        prediction = {},
+        belief = {},
+        uncertainty = {},
+        novelty = {},
+        info_value = {},
+        pruning = {},
+        learning_updates = {},
+        search_stats = {},
+        self_critique = {},
+        training_samples = {},
+        mcts = {},
+        disagreement = {},
+        regret = {},
+        responsibility = {},
+        epistemic = {},
+        layered = {},
+        classifier = {},
+        strategic = {},
+        eval_mining = {},
+        rollback = {},
+        tournaments = {},
+        causal = {},
+        degradation = {},
+        shaping = {},
+        benchmarks = {},
+        rl = {},
+        muzero = {}
+    }
+
+    self.learning = {
+        enabled = self.config.ablations.learning,
+        value_bias = 0.0,
+        step_size = 0.0005,
+        updates = 0,
+        offline_method = "spsa"
+    }
+
+    self.nn = nil -- optional manual-forward critic
+    self.critic = {
+        enabled = self.config.learned_critic.enabled,
+        blend = self.config.learned_critic.blend,
+        input_dim = self.config.learned_critic.input_dim,
+        hidden_dim = self.config.learned_critic.hidden_dim,
+        learning_rate = self.config.learned_critic.learning_rate,
+        weights = nil,
+        updates = 0,
+        last_loss = 0
+    }
+    self:loadOrInitCritic()
+
+    self.motor_noise = (1 - self.config.difficulty) * 0.12
+    self:loadWorldModel()
+
+    return self
+end
+
+function AI:_getDirectionToOpponent(state)
+    return ((state.px or 0) > (state.ox or 0)) and 1 or -1
+end
+
+function AI:_moveToward(state, who)
+    local dir
+    if who == "opp" then
+        dir = self:_getDirectionToOpponent(state)
+        state.ox = state.ox + 8 * dir
+    else
+        dir = ((state.ox or 0) > (state.px or 0)) and 1 or -1
+        state.px = state.px + 8 * dir
+    end
+end
+
+function AI:_moveAway(state, who)
+    local dir
+    if who == "opp" then
+        dir = self:_getDirectionToOpponent(state)
+        state.ox = state.ox - 8 * dir
+    else
+        dir = ((state.ox or 0) > (state.px or 0)) and 1 or -1
+        state.px = state.px - 8 * dir
+    end
+end
+
+function AI:_actionInRange(state, action)
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+    local fd = FRAME_DATA[action] or FRAME_DATA.idle
+    if action == "throw" then return dist <= 20 end
+    if #fd.hitboxes > 0 then
+        local maxw = 0
+        for _, hb in ipairs(fd.hitboxes) do maxw = math.max(maxw, hb.w or 0) end
+        if dist > maxw + 8 then return false end
+    end
+    if action == "special" then return (state.o_meter or 0) >= GAME_CONSTANTS.SPECIAL_FLUX_COST end
+    return true
+end
+
+function AI:_canCancel(current, into, frame)
+    local fd = FRAME_DATA[current] or FRAME_DATA.idle
+    local routes = fd.cancel and fd.cancel[into]
+    if not routes then return false end
+    for _, f in ipairs(routes) do
+        if f == frame then return true end
+    end
+    return false
+end
+
+function AI:_isActive(fd, f)
+    return f > fd.startup and f <= (fd.startup + fd.active)
+end
+
+function AI:_isMoveDone(fd, f)
+    return f > (fd.startup + fd.active + fd.recovery)
+end
+
+function AI:_currentPhase(state)
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+    if (state.p_hitstun or 0) > 0 or (state.o_hitstun or 0) > 0 then return "scramble" end
+    if (state.p_blockstun or 0) > 0 or (state.o_blockstun or 0) > 0 then return "pressure" end
+    if dist < 65 then return "wakeup" end
+    return "neutral"
+end
+
+function AI:_nonlinearRiskPenalty(risk, life_lead)
+    local curve = risk * risk * 0.12
+    if life_lead > 10 then curve = curve * 1.35 end
+    return curve
+end
+
+function AI:_perfectHash(state)
+    local z = self.zobrist or init_zobrist(self.rng or make_rng(1337))
+    self.zobrist = z
+
+    local function qb(v, s, n)
+        return clamp(math.floor((v or 0) / s) + 1, 1, n)
+    end
+
+    local px = qb(state.px, 8, 110)
+    local ox = qb(state.ox, 8, 110)
+    local py = qb(state.py, 8, 110)
+    local oy = qb(state.oy, 8, 110)
+    local php = qb(state.p_health, 5, 20)
+    local ohp = qb(state.o_health, 5, 20)
+    local pm = qb(state.p_meter, 10, 10)
+    local om = qb(state.o_meter, 10, 10)
+    local pst = qb(state.p_hitstun, 1, 32)
+    local ost = qb(state.o_hitstun, 1, 32)
+
+    local h = 0
+    h = h ~ z.buckets[px]
+    h = h ~ z.buckets[ox + 110]
+    h = h ~ z.buckets[py]
+    h = h ~ z.buckets[oy + 110]
+    h = h ~ z.hp[php]
+    h = h ~ z.hp[ohp]
+    h = h ~ z.meter[pm]
+    h = h ~ z.meter[om]
+    h = h ~ z.stun[pst]
+    h = h ~ z.stun[ost]
+    h = h ~ (z.move[state.p_move or "idle"] or 0)
+    h = h ~ (z.move[state.o_move or "idle"] or 0)
+    return h
+end
+
+function AI:_hashState(state)
+    local q = function(v, s) return math.floor((v or 0) / s) end
+    local zh = self:_perfectHash(state)
+    return string.format(
+        "%d|%d|%d|%d|%d|%d|%d|%d|%s|%s|%d|%d|%d",
+        q(state.px, 8), q(state.ox, 8), q(state.py, 8), q(state.oy, 8),
+        q(state.p_health, 5), q(state.o_health, 5), q(state.p_meter, 10), q(state.o_meter, 10),
+        state.p_move or "idle", state.o_move or "idle", state.p_hitstun or 0, state.o_hitstun or 0, zh
+    )
+end
+
+function AI:_estimateNovelty(state)
+    local key = self:_hashState(state)
+    self.novelty_memory = self.novelty_memory or {}
+    local seen = self.novelty_memory[key] or 0
+    self.novelty_memory[key] = seen + 1
+    return 1.0 / (1 + seen)
+end
+
+function AI:_observeState()
+    local true_state = {
+        px = self.player.x or 0,
+        py = self.player.y or 0,
+        ox = self.opponent.x or 0,
+        oy = self.opponent.y or 0,
+        p_health = self.player.health or 100,
+        o_health = self.opponent.health or 100,
+        p_meter = self.player.specialMeter or 0,
+        o_meter = self.opponent.specialMeter or 0,
+        p_hitstun = self.player.hitstun or 0,
+        o_hitstun = self.opponent.hitstun or 0,
+        p_blockstun = self.player.blockstun or 0,
+        o_blockstun = self.opponent.blockstun or 0,
+        p_move = self.player.current_move or "idle",
+        o_move = self.opponent.current_move or "idle",
+        screen_w = self.player.screen_w or GAME_CONSTANTS.SCREEN_W,
+        frame_advantage = 0,
+        risk = 0,
+        uncertainty = self.config.observation_noise
+    }
+
+    local noisy = deepcopy(true_state)
+    if self.config.ablations.uncertainty then
+        local n = self.config.observation_noise
+        noisy.px = noisy.px + (self.rng() * 2 - 1) * n * 100
+        noisy.ox = noisy.ox + (self.rng() * 2 - 1) * n * 100
+    end
+
+    table.insert(self.reaction_buffer, noisy)
+    if #self.reaction_buffer > self.config.reaction_delay_frames then
+        return table.remove(self.reaction_buffer, 1)
+    end
+    return noisy
+end
+
+function AI:_updatePlayerModel(observation, player_action)
+    if not self.config.ablations.player_model then return end
+    local action = player_action or "unknown"
+
+    local st = self.player_model.short_term_window
+    st[#st + 1] = action
+    if #st > 240 then table.remove(st, 1) end
+
+    self.player_model.long_term_counts[action] = (self.player_model.long_term_counts[action] or 0) + 1
+    local phase = self:_currentPhase(observation)
+    local ckey = string.format("%s|%s|%s", self.last_action or "idle", phase, action)
+    self.player_model.conditional[ckey] = (self.player_model.conditional[ckey] or 0) + 1
+
+    local total = 0
+    for _, c in pairs(self.player_model.long_term_counts) do total = total + c end
+    self.player_model.confidence[action] = total > 0 and ((self.player_model.long_term_counts[action] or 0) / total) or 0
+
+    local cm = self.player_model.conditioning_memory
+    if action == "throw_tech" then cm.no_throw_tech_streak = 0 else cm.no_throw_tech_streak = cm.no_throw_tech_streak + 1 end
+    if action == "jump_after_block_light" then cm.jump_after_block_light = cm.jump_after_block_light + 1 end
+    if action == "block_after_light" then cm.block_light_trials = cm.block_light_trials + 1 end
+    if cm.block_light_trials > 0 then
+        cm.personalized_bait_timing = clamp(4 + cm.jump_after_block_light / cm.block_light_trials * 6, 4, 12)
+    end
+
+    local recent_n = math.min(#st, 60)
+    if recent_n > 0 then
+        local aggro, backdash, mash, panic = 0, 0, 0, 0
+        for i = #st - recent_n + 1, #st do
+            local a = st[i]
+            if a == "light" or a == "heavy" or a == "special" then aggro = aggro + 1 end
+            if a == "walk_back" then backdash = backdash + 1 end
+            if a == "light" and i > 1 and st[i - 1] == "light" then mash = mash + 1 end
+            if a == "special" and (self.player.health or 0) < 30 then panic = panic + 1 end
+        end
+        self.player_model.style.aggression = aggro / recent_n
+        self.player_model.style.backdash_frequency = backdash / recent_n
+        self.player_model.style.mash_spike = mash / recent_n
+        self.player_model.style.panic_reversal = panic / recent_n
+        self.player_model.style.tilt_level = clamp((mash + panic) / recent_n, 0, 1)
+    end
+end
+
+function AI:_updateHumanPolicyModel(observation, player_action)
+    local hp = self.human_policy
+    local a = player_action or "unknown"
+    local w = hp.windows.actions
+    w[#w + 1] = a
+    if #w > 160 then table.remove(w, 1) end
+
+    local tw = hp.windows.timings
+    local dt = (self.frame > 1) and ((self.frame - (self._last_obs_frame or self.frame)) or 1) or 1
+    self._last_obs_frame = self.frame
+    tw[#tw + 1] = dt
+    if #tw > 160 then table.remove(tw, 1) end
+
+    local tbin = tostring(math.floor(clamp(dt, 1, 20)))
+    hp.frame_perfect_timing[tbin] = (hp.frame_perfect_timing[tbin] or 0) + 1
+
+    if #w >= 2 then
+        local key = string.format("%s->%s", w[#w - 1], w[#w])
+        hp.habit_chains[key] = (hp.habit_chains[key] or 0) + 1
+    end
+
+    local low_hp = ((self.player.health or observation.p_health or 100) <= 20)
+    local mash = (a == "light" and #w >= 2 and w[#w - 1] == "light") and 1 or 0
+    if low_hp then
+        hp.tilt_patterns.low_hp_actions = (hp.tilt_patterns.low_hp_actions or 0) + 1
+        hp.tilt_patterns.low_hp_mash = (hp.tilt_patterns.low_hp_mash or 0) + mash
+    end
+    if a == "block" and (observation.p_hitstun or 0) > 0 then
+        hp.tilt_patterns.missed_parry = (hp.tilt_patterns.missed_parry or 0) + 1
+    end
+    if a == "block" and (observation.o_hitstun or 0) > 0 then
+        hp.tilt_patterns.perfect_shield = (hp.tilt_patterns.perfect_shield or 0) + 1
+    end
+
+    local c = hp.conditioning
+    local n = #w
+    c.shielded_3x = (n >= 3 and w[n] == "block" and w[n-1] == "block" and w[n-2] == "block")
+    c.jumped_2x = (n >= 2 and w[n] == "jump" and w[n-1] == "jump")
+    c.mashed_after_loss = (low_hp and mash == 1)
+
+    local ds = hp.deception_state or { fake_repeat = 0, bait_arm = false }
+    if c.shielded_3x then
+        ds.fake_repeat = math.min(6, (ds.fake_repeat or 0) + 1)
+    else
+        ds.fake_repeat = math.max(0, (ds.fake_repeat or 0) - 1)
+    end
+    ds.bait_arm = (ds.fake_repeat or 0) >= 2 or c.jumped_2x or c.mashed_after_loss
+    hp.deception_state = ds
+
+    local evidence = 0
+    if c.shielded_3x then evidence = evidence + 1 end
+    if c.jumped_2x then evidence = evidence + 1 end
+    if c.mashed_after_loss then evidence = evidence + 1 end
+    hp.confidence = clamp(0.92 * (hp.confidence or 0) + 0.08 * (evidence / 3), 0, 1)
+end
+
+function AI:simulateKnockback(target_percent, kb_base, kb_growth, hit_angle, position)
+    local pct = math.max(0, target_percent or 0)
+    local base = kb_base or 28
+    local growth = kb_growth or 1.05
+    local ang = math.rad(hit_angle or 45)
+
+    local kb = base + growth * pct
+    local vx = math.cos(ang) * kb * 0.095
+    local vy = -math.sin(ang) * kb * 0.095
+
+    local x = position and (position.x or 0) or 0
+    local y = position and (position.y or GAME_CONSTANTS.PLATFORM_Y) or GAME_CONSTANTS.PLATFORM_Y
+    local blast_x = GAME_CONSTANTS.SCREEN_W + 110
+    local blast_y = -140
+
+    local frames_to_death = 999
+    local max_frames = 120
+    for f = 1, max_frames do
+        x = x + vx
+        y = y + vy
+        vy = vy + GAME_CONSTANTS.GRAVITY * 0.55
+        vx = vx * 0.992
+        if math.abs(x) > blast_x or y < blast_y then
+            frames_to_death = f
+            break
+        end
+    end
+
+    return { kb = kb, frames_to_death = frames_to_death, final_x = x, final_y = y }
+end
+
+function AI:killConfirmPercent(target_percent, kb_base, kb_growth, hit_angle, position)
+    local traj = self:simulateKnockback(target_percent, kb_base, kb_growth, hit_angle, position)
+    return traj.frames_to_death < 10, traj
+end
+
+function AI:proPlayerHeuristic(move, state)
+    local hp = self.human_policy
+    local cond = hp.conditioning or {}
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+    local disadv = ((state.p_hitstun or 0) > 0) or ((state.p_blockstun or 0) > 0) or ((state.frame_advantage or 0) < 0)
+    local score = 1.0
+
+    if disadv and move == "block" then score = score + 0.65 end
+    if cond.shielded_3x and (move == "throw" or move == "heavy") then score = score + 0.45 end
+    if cond.jumped_2x and move == "light" and FRAME_DATA.light.anti_air then score = score + 0.55 end
+    if cond.mashed_after_loss and move == "block" then score = score + 0.35 end
+
+    if dist < 34 and move == "throw" then score = score + 0.4 end
+    if dist > 120 and move == "special" then score = score + 0.25 end
+    if move == "jump" and cond.jumped_2x then score = score - 0.25 end
+
+    local dp = hp.deception_state
+    if dp and dp.bait_arm and (move == "walk_back" or move == "block") then score = score + 0.25 end
+
+    local kill, _ = self:killConfirmPercent(state.p_health or 0, 34, 1.22, 43, { x = state.px or 0, y = state.py or GAME_CONSTANTS.PLATFORM_Y })
+    if kill and (move == "heavy" or move == "special") then score = score + 0.7 end
+
+    return clamp(score, 0.1, 3.5)
+end
+
+function AI:humanBiasedPolicy(state, temperature)
+    local legal_moves = self:_legalActionSet(state)
+    local scores = {}
+    for _, move in ipairs(legal_moves) do
+        local prior = self:_policyPrior(state, move)
+        scores[move] = self:proPlayerHeuristic(move, state) * prior
+    end
+    return softmax_map(scores, temperature or 1.2)
+end
+
+function AI:_epistemicMode()
+    local c = self.belief.confidence or 0.5
+    local u = self.belief.uncertainty or (1 - (self.belief.accuracy or 0.5))
+    if c > 0.78 and u < 0.28 then return "certain" end
+    if c < 0.45 or u > 0.55 then return "uncertain" end
+    return "balanced"
+end
+
+function AI:_recordCausalEvent(stage, payload)
+    self.causal_trace[#self.causal_trace + 1] = { frame = self.frame, stage = stage, payload = deepcopy(payload or {}) }
+    if #self.causal_trace > 240 then table.remove(self.causal_trace, 1) end
+end
+
+function AI:_gracefulDegradationMode(obs)
+    local mode = self:_epistemicMode()
+    local volatility = self:_volatilityScore(obs)
+    if mode == "uncertain" and volatility > self.config.self_improvement.volatility_trigger then
+        return "fundamentals"
+    end
+    if mode == "uncertain" then return "buy_time" end
+    return "normal"
+end
+
+function AI:_shapeOpponent(meta)
+    local mode = self:_epistemicMode()
+    local s = self.opponent_shaping
+    if mode == "certain" and (meta.action_confidence or 0) > 0.7 then
+        s.revealed_weakness = true
+        s.bait_window = 10
+    elseif s.bait_window > 0 then
+        s.bait_window = s.bait_window - 1
+    else
+        s.revealed_weakness = false
+    end
+
+    if s.revealed_weakness and (self.last_action == "walk_back" or self.last_action == "block") then
+        s.conditioned = s.conditioned + 1
+    end
+    self.logs.shaping[#self.logs.shaping + 1] = { frame = self.frame, revealed_weakness = s.revealed_weakness, bait_window = s.bait_window, conditioned = s.conditioned }
+end
+
+function AI:_causalPostmortem()
+    if #self.causal_trace < 8 then return end
+    local worst, worst_i = nil, -1
+    for i = math.max(1, #self.causal_trace - 40), #self.causal_trace do
+        local e = self.causal_trace[i]
+        local score = (e.payload and e.payload.delta_eval) or 0
+        if worst == nil or score < worst then worst, worst_i = score, i end
+    end
+    if not worst_i or worst_i < 1 then return end
+
+    local root = self:_initSimState(self:_observeState())
+    local alternatives = { "block", "walk_back", "light", "throw" }
+    local best_alt, best_score = nil, -1e9
+    for _, a in ipairs(alternatives) do
+        local n = self:_applyActionOrMacro(root, a, "idle", 6)
+        local sc = self:evaluateState(n)
+        if sc > best_score then best_score = sc; best_alt = a end
+    end
+
+    self.logs.causal[#self.logs.causal + 1] = {
+        frame = self.frame,
+        pivotal_event = self.causal_trace[worst_i],
+        best_alternative = best_alt,
+        best_score = best_score,
+        diagnosis = "upstream_neutral_error"
+    }
+
+    if best_score > 0 then
+        self.config.risk_tolerance = clamp(self.config.risk_tolerance - 0.02, 0.2, 0.85)
+        self.belief.confidence = clamp((self.belief.confidence or 0.5) - 0.015, 0.1, 0.95)
+    end
+end
+
+function AI:_updateBeliefState(observation, player_action)
+    if not self.config.ablations.belief_reasoning then return end
+    local action = player_action or "unknown"
+    local b = self.belief
+    local style = self.player_model.style
+
+    local pressure_signal = clamp((style.aggression or 0.5) * 0.7 + (1 - (style.backdash_frequency or 0.5)) * 0.3, 0, 1)
+    b.perceived_threat = clamp(0.9 * b.perceived_threat + 0.1 * pressure_signal, 0, 1)
+    b.respect_decay = clamp(b.respect_decay + ((action == "block" or action == "walk_back") and 0.01 or -0.01), 0, 1)
+
+    local feint = (self.last_action == "walk_fwd" or self.last_action == "idle")
+    if feint then
+        b.feint_trials = b.feint_trials + 1
+        if action == "block" or action == "walk_back" then b.feint_punishes = b.feint_punishes + 1 end
+    end
+
+    local evidence = (b.feint_trials > 0) and (b.feint_punishes / b.feint_trials) or 0.5
+    b.confidence = clamp(0.7 * b.confidence + 0.3 * evidence, 0.1, 0.95)
+
+    local bj = b.bayes.jump_after_block_light
+    if self.last_action == "light" and action == "jump" then bj.alpha = bj.alpha + 1 else bj.beta = bj.beta + 1 end
+    local br = b.bayes.panic_reversal
+    if action == "special" and (self.player.health or 0) < 30 then br.alpha = br.alpha + 1 else br.beta = br.beta + 1 end
+
+    b.opponent_model_of_us.expects_patience = clamp(0.95 * b.opponent_model_of_us.expects_patience + ((self.last_action == "block" or self.last_action == "walk_back") and 0.04 or -0.02), 0, 1)
+    b.opponent_model_of_us.expects_throw = clamp(0.95 * b.opponent_model_of_us.expects_throw + ((self.last_action == "throw") and 0.05 or -0.02), 0, 1)
+
+    self.cross_match_memory.strategy_popularity[self.last_action or "idle"] = (self.cross_match_memory.strategy_popularity[self.last_action or "idle"] or 0) + 1
+    local prev = self.cross_match_memory.adaptation_speed[action] or 0
+    self.cross_match_memory.adaptation_speed[action] = 0.9 * prev + 0.1 * ((self.belief.respect_decay > 0.4) and 1 or 0)
+
+    self:_updateBeliefAccuracy(observation)
+end
+
+
+function AI:_updateBeliefAccuracy(observation)
+    local est = self.belief.state_estimate
+    local err = math.abs((est.px or 0) - (observation.px or 0)) + math.abs((est.ox or 0) - (observation.ox or 0))
+    err = err + math.abs((est.p_health or 0) - (observation.p_health or 0)) * 0.5
+    local acc = clamp(1 - err / 300, 0, 1)
+    self.belief.accuracy = 0.8 * (self.belief.accuracy or 0.5) + 0.2 * acc
+    self.belief.uncertainty = clamp(1 - self.belief.accuracy, 0, 1)
+    self.belief.overconfidence = clamp((self.belief.confidence or 0.5) - self.belief.accuracy, 0, 1)
+    self.belief.certainty_spike = ((self.belief.confidence or 0.5) > 0.8 and self.belief.uncertainty < 0.25) and 1 or 0
+
+    self.belief.state_estimate = {
+        px = 0.7 * (est.px or observation.px or 0) + 0.3 * (observation.px or 0),
+        ox = 0.7 * (est.ox or observation.ox or 0) + 0.3 * (observation.ox or 0),
+        p_health = 0.8 * (est.p_health or observation.p_health or 100) + 0.2 * (observation.p_health or 100),
+        o_health = 0.8 * (est.o_health or observation.o_health or 100) + 0.2 * (observation.o_health or 100)
+    }
+end
+
+function AI:_dominantEvalTerms(breakdown)
+    local arr = {}
+    for k, v in pairs(breakdown) do
+        if type(v) == "number" then arr[#arr + 1] = { key = k, mag = math.abs(v), val = v } end
+    end
+    table.sort(arr, function(a, b) return a.mag > b.mag end)
+    return arr
+end
+
+function AI:_flipCandidates(features)
+    local flips = {
+        { key = "health_diff", delta = -8 },
+        { key = "frame_advantage", delta = -2 },
+        { key = "risk_exposure", delta = 2 },
+        { key = "uncertainty", delta = 0.15 }
+    }
+    return flips
+end
+
+function AI:_decisionConfidenceAndRisk(root, action, branches)
+    local vals = {}
+    for _, br in ipairs(branches or {}) do
+        local child = self:_applyActionOrMacro(root, action, br.action, 6)
+        local v = self:evaluateState(child)
+        vals[#vals + 1] = v
+    end
+    if #vals == 0 then return 0.5, 0, 0 end
+    local mean = 0
+    local worst = 1e9
+    for _, v in ipairs(vals) do mean = mean + v; if v < worst then worst = v end end
+    mean = mean / #vals
+    local var = 0
+    for _, v in ipairs(vals) do var = var + (v - mean) * (v - mean) end
+    var = var / #vals
+    local conf = clamp(1 / (1 + var / 200), 0.05, 0.99)
+    return conf, worst, mean
+end
+
+function AI:_mineSearchDisagreement(root)
+    local deadline_shallow = now_ms() + 0.6
+    local s_score, s_act = self:_negaExpectimax(deepcopy(root), 2, -1e9, 1e9, deadline_shallow, 2)
+    local deep_d = math.min(8, self.config.max_rollout_depth)
+    local deadline_deep = now_ms() + 1.4
+    local d_score, d_act = self:_negaExpectimax(deepcopy(root), deep_d, -1e9, 1e9, deadline_deep, deep_d)
+
+    local delta = (d_score or 0) - (s_score or 0)
+    if s_act ~= d_act or delta < -8 then
+        self.logs.disagreement[#self.logs.disagreement + 1] = {
+            frame = self.frame,
+            shallow_action = s_act,
+            deep_action = d_act,
+            shallow_score = s_score,
+            deep_score = d_score,
+            delta = delta
+        }
+
+        local bad = self.last_breakdown or {}
+        local top = self:_dominantEvalTerms(bad)
+        local t = top[1] and top[1].key
+        if t and self.config.eval_weights[t] ~= nil then
+            self.config.eval_weights[t] = self.config.eval_weights[t] * 0.985
+            self.logs.eval_mining[#self.logs.eval_mining + 1] = { frame = self.frame, type = "deep_disagreement_weight_decay", feature = t, delta = delta }
+        end
+    end
+end
+
+function AI:_updateStrategyRegret(strategy, realized, counterfactual, context)
+    local key = strategy or "unknown"
+    local mem = self.cross_match_memory.regret_memory[key] or { regret = 0, decay = 0.98, uses = 0, retired = false, context = {} }
+    local instant = (counterfactual or realized) - (realized or 0)
+    mem.regret = mem.regret * mem.decay + instant
+    mem.uses = mem.uses + 1
+    mem.context[context or "default"] = (mem.context[context or "default"] or 0) + instant
+    if mem.regret > 12 and mem.uses > 8 then mem.retired = true end
+    if mem.regret < 4 then mem.retired = false end
+    self.cross_match_memory.regret_memory[key] = mem
+    self.logs.regret[#self.logs.regret + 1] = { frame = self.frame, strategy = key, regret = mem.regret, retired = mem.retired }
+end
+
+function AI:_counterfactualResponsibility(obs, action)
+    local options = { "block", "walk_back", "light", "throw", "special" }
+    local best_alt, best_score = action, -1e9
+    local realized = self:evaluateState(obs)
+    local root = self:_initSimState(obs)
+    local chosen_next = self:_applyActionOrMacro(root, action or "idle", "idle", 6)
+    local chosen_score = self:evaluateState(chosen_next)
+
+    for _, a in ipairs(options) do
+        local n = self:_applyActionOrMacro(root, a, "idle", 6)
+        local sc = self:evaluateState(n)
+        if sc > best_score then best_score = sc; best_alt = a end
+    end
+
+    local blame = (best_score or realized) - (chosen_score or realized)
+    if blame > 4 then
+        self.config.risk_tolerance = clamp(self.config.risk_tolerance - 0.03, 0.2, 0.9)
+        self.belief.confidence = clamp((self.belief.confidence or 0.5) - 0.02, 0.1, 0.95)
+        local key = self.last_action or "idle"
+        self.player_model.confidence[key] = clamp((self.player_model.confidence[key] or 0.5) * 0.95, 0, 1)
+        local hp = self.human_policy
+        hp.skill_ceiling = clamp((hp.skill_ceiling or 0.5) - 0.035, 0.1, 0.95)
+    else
+        local hp = self.human_policy
+        hp.skill_ceiling = clamp((hp.skill_ceiling or 0.5) + 0.015, 0.1, 0.95)
+    end
+
+    self.logs.responsibility[#self.logs.responsibility + 1] = {
+        frame = self.frame,
+        chosen = action,
+        chosen_score = chosen_score,
+        best_alternative = best_alt,
+        best_score = best_score,
+        blame = blame
+    }
+end
+
+function AI:_isStrategyRetired(name)
+    local m = self.cross_match_memory.regret_memory[name]
+    return m and m.retired or false
+end
+
+function AI:_updateTimescalePlan(obs)
+    self.timescale.frame_clock = self.timescale.frame_clock + 1
+    self.timescale.round_clock = self.timescale.round_clock + 1
+
+    local hp_delta = (self.opponent.health or 0) - (self.player.health or 0)
+    local meter_adv = (self.opponent.specialMeter or 0) - (self.player.specialMeter or 0)
+    if hp_delta > 25 then
+        self.timescale.match_plan = "low_variance_closeout"
+    elseif meter_adv < -20 and self.timescale.round_clock < 1200 then
+        self.timescale.match_plan = "meter_rebuild_patience"
+    elseif self.timescale.round_clock < 600 then
+        self.timescale.match_plan = "data_gathering"
+    else
+        self.timescale.match_plan = "adaptive_pressure"
+    end
+
+    if hp_delta > 15 and (self.belief.uncertainty or 0.5) > 0.45 then
+        self.timescale.match_plan = "control_over_damage"
+    end
+end
+
+function AI:_propagateUncertainty(parent_state, action, branch_confidence)
+    local action_risk = (action == "heavy" or action == "special") and 0.2 or 0.08
+    local reaction_limit = clamp((self.config.reaction_delay_frames - 4) / 16, 0, 1)
+    local fragility = clamp(1 - (branch_confidence or 0.5), 0, 1)
+    local u0 = parent_state.uncertainty or self.config.observation_noise
+    return clamp(u0 * 0.8 + action_risk + 0.5 * fragility + 0.3 * reaction_limit, 0, 1)
+end
+
+function AI:extractFeatures(state)
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+    local phase = self:_currentPhase(state)
+
+    local features = {
+        frame_advantage = state.frame_advantage or 0,
+        corner_pressure = 1.0 - math.min(1.0, ((state.px or 0) / (state.screen_w or 800))),
+        resource_availability = (state.o_meter or 0) / 100,
+        initiative = ((state.o_hitstun or 0) == 0 and (state.p_hitstun or 0) > 0) and 1 or 0,
+        recovery_lock = state.recovery_lock or 0,
+        threat_count = ((dist < 55) and 1 or 0) + ((dist < 75) and 1 or 0) + (((state.o_meter or 0) >= 50 and dist < 110) and 1 or 0),
+        health_diff = (state.o_health or 0) - (state.p_health or 0),
+        risk_exposure = state.risk or 0,
+        uncertainty = state.uncertainty or 0.2,
+        robustness = 1 - (state.uncertainty or 0.2),
+        info_gain = state.info_gain or 0,
+        deception_value = state.deception_value or 0,
+        neutral_control = clamp(1.0 - dist / 260, 0, 1),
+        frame_trap_potential = ((state.frame_advantage or 0) > 1) and 1 or 0,
+        throw_threat = (dist < 45 and (state.o_meter or 0) >= 20) and 1 or 0,
+        anti_air_readiness = ((self.belief.opponent_belief.expects_anti_air or 0.5) < 0.45) and 1 or 0,
+        phase = phase
+    }
+
+    if (state.o_health or 0) <= 0 then features.round_win = 1 else features.round_win = 0 end
+    if (state.p_health or 0) <= 0 then features.round_loss = 1 else features.round_loss = 0 end
+
+    return features
+end
+
+function AI:_criticFeatureVector(features)
+    local order = {
+        "health_diff", "frame_advantage", "corner_pressure", "resource_availability", "threat_count",
+        "risk_exposure", "uncertainty", "neutral_control", "throw_threat", "anti_air_readiness",
+        "initiative", "recovery_lock", "frame_trap_potential", "robustness", "info_gain",
+        "deception_value", "round_win", "round_loss", "phase_is_pressure", "phase_is_scramble"
+    }
+    local f = deepcopy(features)
+    f.phase_is_pressure = (features.phase == "pressure") and 1 or 0
+    f.phase_is_scramble = (features.phase == "scramble") and 1 or 0
+
+    local x = {}
+    for i = 1, #order do x[i] = f[order[i]] or 0 end
+    return x
+end
+
+function AI:loadOrInitCritic(weights)
+    local cfg = self.config.learned_critic
+    if not self.critic then return false end
+
+    if weights and type(weights) == "table" then
+        self.critic.weights = deepcopy(weights)
+        self.critic.enabled = true
+        return true
+    end
+
+    if self.critic.weights then return true end
+
+    local d = cfg.input_dim
+    local h = cfg.hidden_dim
+    local w = { layer1 = {}, bias1 = {}, out = {}, bias_out = 0 }
+    for i = 1, d do
+        w.layer1[i] = {}
+        for j = 1, h do w.layer1[i][j] = (self.rng() * 2 - 1) * 0.05 end
+    end
+    for j = 1, h do
+        w.bias1[j] = 0
+        w.out[j] = (self.rng() * 2 - 1) * 0.05
+    end
+    self.critic.weights = w
+    return true
+end
+
+function AI:_criticForward(features)
+    if not self.critic or not self.critic.enabled or not self.critic.weights then return 0, nil end
+    local x = self:_criticFeatureVector(features)
+    local w = self.critic.weights
+    local h = {}
+    for j = 1, self.critic.hidden_dim do
+        local s = w.bias1[j] or 0
+        for i = 1, self.critic.input_dim do
+            s = s + (x[i] or 0) * ((w.layer1[i] and w.layer1[i][j]) or 0)
+        end
+        h[j] = math.tanh(s)
+    end
+    local out = w.bias_out or 0
+    for j = 1, self.critic.hidden_dim do out = out + h[j] * (w.out[j] or 0) end
+    local val = math.tanh(out) * 100
+    return val, { x = x, h = h, out_raw = out, val = val }
+end
+
+function AI:_criticTrainStep(features, target)
+    local pred, cache = self:_criticForward(features)
+    if not cache then return 0 end
+
+    local t = clamp(target or 0, -100, 100)
+    local y = pred / 100
+    local dy = (t / 100 - y)
+    local dout = dy * (1 - math.tanh(cache.out_raw) ^ 2)
+
+    local lr = self.critic.learning_rate
+    local w = self.critic.weights
+
+    for j = 1, self.critic.hidden_dim do
+        w.out[j] = (w.out[j] or 0) + lr * dout * (cache.h[j] or 0)
+    end
+    w.bias_out = (w.bias_out or 0) + lr * dout
+
+    for j = 1, self.critic.hidden_dim do
+        local dh = dout * (w.out[j] or 0) * (1 - (cache.h[j] or 0) ^ 2)
+        for i = 1, self.critic.input_dim do
+            w.layer1[i][j] = (w.layer1[i][j] or 0) + lr * dh * (cache.x[i] or 0)
+        end
+        w.bias1[j] = (w.bias1[j] or 0) + lr * dh
+    end
+
+    local loss = 0.5 * (t - pred) * (t - pred)
+    self.critic.updates = self.critic.updates + 1
+    self.critic.last_loss = 0.95 * (self.critic.last_loss or loss) + 0.05 * loss
+    return loss
+end
+
+function AI:trainCriticFromLogs(opts)
+    local o = opts or {}
+    local epochs = o.epochs or 2
+    local limit = o.limit or 512
+    local total, n = 0, 0
+    local start_i = math.max(1, #self.logs.training_samples - limit + 1)
+    for _ = 1, epochs do
+        for i = start_i, #self.logs.training_samples do
+            local smp = self.logs.training_samples[i]
+            local state = smp and smp.state
+            if state then
+                local _, f = self:evaluateState(state)
+                local target = (smp.search_score ~= nil) and smp.search_score or (self.logs.eval_scores[i] or 0)
+                total = total + self:_criticTrainStep(f, target)
+                n = n + 1
+            end
+        end
+    end
+    local avg = (n > 0) and (total / n) or 0
+    self.logs.rl[#self.logs.rl + 1] = { frame = self.frame, type = "learned_critic_train", epochs = epochs, samples = n, loss = avg }
+    return { epochs = epochs, samples = n, avg_loss = avg, updates = self.critic.updates }
+end
+
+function AI:_manualCriticForward(features)
+    if not self.nn or not self.config.hybrid.critic_enabled then return nil, nil end
+    local x = {
+        features.health_diff or 0, features.frame_advantage or 0, features.corner_pressure or 0,
+        features.resource_availability or 0, features.threat_count or 0, features.risk_exposure or 0,
+        features.uncertainty or 0, features.neutral_control or 0, features.throw_threat or 0,
+        features.anti_air_readiness or 0
+    }
+    local value = 0
+    for i = 1, #x do
+        value = value + (self.nn.value_w and self.nn.value_w[i] or 0) * x[i]
+    end
+    value = math.tanh(value)
+    return value, nil
+end
+
+function AI:evaluateFeatures(features)
+    local w = self.config.eval_weights
+    local score = 0
+    score = score + w.frame_advantage * (features.frame_advantage or 0)
+    score = score + w.corner_pressure * (features.corner_pressure or 0)
+    score = score + w.resource_availability * (features.resource_availability or 0)
+    score = score + w.initiative * (features.initiative or 0)
+    score = score + w.recovery_lock * (features.recovery_lock or 0)
+    score = score + w.threat_count * (features.threat_count or 0)
+    score = score + w.health_diff * (features.health_diff or 0)
+    score = score + w.risk_exposure * (features.risk_exposure or 0)
+    score = score + w.neutral_control * (features.neutral_control or 0)
+    score = score + w.frame_trap_potential * (features.frame_trap_potential or 0)
+    score = score + w.throw_threat * (features.throw_threat or 0)
+    score = score + w.anti_air_readiness * (features.anti_air_readiness or 0)
+
+    score = score - 0.6 * (features.uncertainty or 0)
+    score = score + 0.45 * (features.robustness or 0)
+    score = score + 0.35 * (features.info_gain or 0)
+    score = score + 0.2 * (features.deception_value or 0)
+
+    score = score * (self.config.phase_weights[features.phase or "neutral"] or 1.0)
+    if self.active_phase_policy and self.active_phase_policy.eval_scale then
+        score = score * self.active_phase_policy.eval_scale
+    end
+    score = score - self:_nonlinearRiskPenalty(features.risk_exposure or 0, features.health_diff or 0)
+
+    score = score + (features.round_win or 0) * 100 - (features.round_loss or 0) * 100
+    return score + self.learning.value_bias
+end
+
+function AI:evaluateState(state)
+    local f = self:extractFeatures(state)
+    local linear = self:evaluateFeatures(f)
+    local nn_value = self:_manualCriticForward(f)
+    local learned_val = 0
+    if self.critic and self.critic.enabled then
+        learned_val = self:_criticForward(f)
+    end
+
+    local score = linear
+    if nn_value and self.config.hybrid.enabled then
+        local sw = clamp(self.config.hybrid.search_weight, 0, 1)
+        score = sw * linear + (1 - sw) * (nn_value * 100)
+    end
+
+    if self.critic and self.critic.enabled then
+        local b = clamp(self.critic.blend or self.config.learned_critic.blend or 0.4, 0, 1)
+        score = (1 - b) * score + b * learned_val
+    end
+
+    return score, f
+end
+
+function AI:dumpEvalBreakdown(state)
+    local f = self:extractFeatures(state)
+    local w = self.config.eval_weights
+    return {
+        frame_advantage = (f.frame_advantage or 0) * w.frame_advantage,
+        corner_pressure = (f.corner_pressure or 0) * w.corner_pressure,
+        resource_availability = (f.resource_availability or 0) * w.resource_availability,
+        initiative = (f.initiative or 0) * w.initiative,
+        recovery_lock = (f.recovery_lock or 0) * w.recovery_lock,
+        threat_count = (f.threat_count or 0) * w.threat_count,
+        health_diff = (f.health_diff or 0) * w.health_diff,
+        risk_exposure = (f.risk_exposure or 0) * w.risk_exposure,
+        neutral_control = (f.neutral_control or 0) * w.neutral_control,
+        frame_trap_potential = (f.frame_trap_potential or 0) * w.frame_trap_potential,
+        throw_threat = (f.throw_threat or 0) * w.throw_threat,
+        anti_air_readiness = (f.anti_air_readiness or 0) * w.anti_air_readiness,
+        uncertainty = -0.6 * (f.uncertainty or 0),
+        robustness = 0.45 * (f.robustness or 0),
+        info_gain = 0.35 * (f.info_gain or 0),
+        deception_value = 0.2 * (f.deception_value or 0),
+        nonlinear_risk = -self:_nonlinearRiskPenalty(f.risk_exposure or 0, f.health_diff or 0),
+        phase = f.phase,
+        value_bias = self.learning.value_bias
+    }
+end
+
+function AI:_initSimState(obs)
+    return {
+        px = obs.px, py = obs.py, ox = obs.ox, oy = obs.oy,
+        p_health = obs.p_health, o_health = obs.o_health,
+        p_meter = obs.p_meter, o_meter = obs.o_meter,
+        p_hitstun = obs.p_hitstun, o_hitstun = obs.o_hitstun,
+        p_blockstun = obs.p_blockstun, o_blockstun = obs.o_blockstun,
+        p_move = obs.p_move or "idle", o_move = obs.o_move or "idle",
+        p_frame = 0, o_frame = 0,
+        p_airborne = false, o_airborne = false,
+        p_vy = 0, o_vy = 0,
+        frame_advantage = 0,
+        risk = 0,
+        uncertainty = obs.uncertainty or self.config.observation_noise,
+        info_gain = 0,
+        deception_value = 0,
+        screen_w = obs.screen_w or 800
+    }
+end
+
+function AI:_applyActionToChar(state, who, action)
+    if who == "opp" then
+        if action == "walk_fwd" then self:_moveToward(state, "opp") end
+        if action == "walk_back" then self:_moveAway(state, "opp") end
+        if action == "jump" and not state.o_airborne then state.o_airborne = true; state.o_vy = -12 end
+        state.o_move = action
+        state.o_frame = 0
+    else
+        if action == "walk_fwd" then self:_moveToward(state, "plr") end
+        if action == "walk_back" then self:_moveAway(state, "plr") end
+        if action == "jump" and not state.p_airborne then state.p_airborne = true; state.p_vy = -12 end
+        state.p_move = action
+        state.p_frame = 0
+    end
+    self.blueprint.updates = self.blueprint.updates + count
+    self.logs.blueprint[#self.logs.blueprint + 1] = { frame = self.frame, updates = count }
+    return { updates = count }
+end
+
+function AI:_cfrKey(state)
+    local phase = self:_currentPhase(state)
+    local dist = math.floor(math.abs((state.ox or 0) - (state.px or 0)) / 20)
+    local adv = (state.frame_advantage or 0) > 0 and "plus" or "minus"
+    return string.format("%s|%s|%d", phase, adv, dist)
+end
+
+function AI:_advanceAir(state)
+    local gravity = GAME_CONSTANTS.GRAVITY
+    if state.o_airborne then
+        state.oy = (state.oy or 0) + state.o_vy
+        state.o_vy = state.o_vy + gravity
+        if state.oy >= GAME_CONSTANTS.PLATFORM_Y - GAME_CONSTANTS.CHAR_HEIGHT / 2 then
+            state.oy = GAME_CONSTANTS.PLATFORM_Y - GAME_CONSTANTS.CHAR_HEIGHT / 2
+            state.o_vy = 0
+            state.o_airborne = false
+        end
+    end
+    if state.p_airborne then
+        state.py = (state.py or 0) + state.p_vy
+        state.p_vy = state.p_vy + gravity
+        if state.py >= GAME_CONSTANTS.PLATFORM_Y - GAME_CONSTANTS.CHAR_HEIGHT / 2 then
+            state.py = GAME_CONSTANTS.PLATFORM_Y - GAME_CONSTANTS.CHAR_HEIGHT / 2
+            state.p_vy = 0
+            state.p_airborne = false
+        end
+    end
+    self.blueprint.updates = self.blueprint.updates + count
+    self.logs.blueprint[#self.logs.blueprint + 1] = { frame = self.frame, updates = count }
+    return { updates = count }
+end
+
+function AI:_resolveSingleHit(attacker, defender, attack_move, state)
+    local fd = FRAME_DATA[attack_move] or FRAME_DATA.idle
+    local defend_move = (defender == "p") and state.p_move or state.o_move
+    local defend_blocking = (defend_move == "block")
+    local defend_air = (defender == "p") and state.p_airborne or state.o_airborne
+
+    if fd.throw then
+        if math.abs((state.ox or 0) - (state.px or 0)) > 20 then return false end
+        local tech = ((defender == "p") and state.p_move == "throw" and state.p_frame <= GAME_CONSTANTS.THROW_TECH_WINDOW)
+            or ((defender == "o") and state.o_move == "throw" and state.o_frame <= GAME_CONSTANTS.THROW_TECH_WINDOW)
+        if tech then
+            if defender == "p" then state.p_blockstun = 6 else state.o_blockstun = 6 end
+            return false
+        end
+    else
+        if defend_air and not fd.air_ok then return false end
+        if (not defend_air) and not fd.ground_ok then return false end
+        if not self:_actionInRange(state, attack_move) then return false end
+    end
+
+    local push_dir = ((state.ox or 0) >= (state.px or 0)) and 1 or -1
+    local guard_damage = (fd.damage or 0) * GAME_CONSTANTS.SHIELD_HIT_DECAY + (fd.guard_crush or 0)
+    if defend_blocking and not fd.throw then
+        if defender == "p" then
+            state.p_blockstun = math.max(state.p_blockstun or 0, math.max(1, -(fd.on_block or 0)))
+            state.p_health = clamp((state.p_health or 0) - (fd.chip or 0), 0, 100)
+            state.p_guard = clamp((state.p_guard or 60) - guard_damage, 0, 60)
+            state.px = (state.px or 0) + push_dir * (fd.pushback_on_block or 0)
+        else
+            state.o_blockstun = math.max(state.o_blockstun or 0, math.max(1, -(fd.on_block or 0)))
+            state.o_health = clamp((state.o_health or 0) - (fd.chip or 0), 0, 100)
+            state.o_guard = clamp((state.o_guard or 60) - guard_damage, 0, 60)
+            state.ox = (state.ox or 0) - push_dir * (fd.pushback_on_block or 0)
+        end
+        state.frame_advantage = fd.on_block or 0
+        if attacker == "o" then state.o_meter = clamp((state.o_meter or 0) + (fd.meter_gain_block or 0), 0, GAME_CONSTANTS.FLUX_CAP) end
+        if attacker == "p" then state.p_meter = clamp((state.p_meter or 0) + (fd.meter_gain_block or 0), 0, GAME_CONSTANTS.FLUX_CAP) end
+        return true
+    end
+
+    local counter_bonus = 0
+    if defender == "p" and (state.p_frame or 0) <= ((FRAME_DATA[state.p_move] or FRAME_DATA.idle).startup or 0) then counter_bonus = GAME_CONSTANTS.FLUX_ON_COUNTER end
+    if defender == "o" and (state.o_frame or 0) <= ((FRAME_DATA[state.o_move] or FRAME_DATA.idle).startup or 0) then counter_bonus = GAME_CONSTANTS.FLUX_ON_COUNTER end
+
+    local damage = (fd.damage or 0) + (counter_bonus > 0 and 2 or 0)
+    if defender == "p" then
+        state.p_health = clamp((state.p_health or 0) - damage, 0, 100)
+        state.p_hitstun = math.max(state.p_hitstun or 0, fd.on_hit or 0)
+        state.px = (state.px or 0) + push_dir * (fd.pushback_on_hit or 0)
+    else
+        state.o_health = clamp((state.o_health or 0) - damage, 0, 100)
+        state.o_hitstun = math.max(state.o_hitstun or 0, fd.on_hit or 0)
+        state.ox = (state.ox or 0) - push_dir * (fd.pushback_on_hit or 0)
+    end
+
+    state.frame_advantage = fd.on_hit or 0
+    if attacker == "o" then state.o_meter = clamp((state.o_meter or 0) + (fd.meter_gain_hit or 0) + counter_bonus, 0, GAME_CONSTANTS.FLUX_CAP) end
+    if attacker == "p" then state.p_meter = clamp((state.p_meter or 0) + (fd.meter_gain_hit or 0) + counter_bonus, 0, GAME_CONSTANTS.FLUX_CAP) end
+    if fd.throw then
+        if defender == "p" then state.p_hitstun = math.max(state.p_hitstun, 20) else state.o_hitstun = math.max(state.o_hitstun, 20) end
+    end
+    return true
+end
+
+function AI:_advanceFrame(state)
+    state.p_hitstun = math.max(0, (state.p_hitstun or 0) - 1)
+    state.o_hitstun = math.max(0, (state.o_hitstun or 0) - 1)
+    state.p_blockstun = math.max(0, (state.p_blockstun or 0) - 1)
+    state.o_blockstun = math.max(0, (state.o_blockstun or 0) - 1)
+
+    self:_advanceAir(state)
+
+    state.o_frame = (state.o_frame or 0) + 1
+    state.p_frame = (state.p_frame or 0) + 1
+
+    local ofd = FRAME_DATA[state.o_move] or FRAME_DATA.idle
+    local pfd = FRAME_DATA[state.p_move] or FRAME_DATA.idle
+
+    if self:_isActive(ofd, state.o_frame) and (state.p_hitstun or 0) == 0 then
+        self:_resolveSingleHit("o", "p", state.o_move, state)
+    end
+    if self:_isActive(pfd, state.p_frame) and (state.o_hitstun or 0) == 0 then
+        self:_resolveSingleHit("p", "o", state.p_move, state)
+    end
+
+    if state.o_queued and self:_canCancel(state.o_move, state.o_queued, state.o_frame or 0) then
+        state.o_move = state.o_queued
+        state.o_frame = 0
+        state.o_queued = nil
+    end
+    if state.p_queued and self:_canCancel(state.p_move, state.p_queued, state.p_frame or 0) then
+        state.p_move = state.p_queued
+        state.p_frame = 0
+        state.p_queued = nil
+    end
+
+    if self:_isMoveDone(ofd, state.o_frame) then state.o_move = "idle"; state.o_frame = 0 end
+    if self:_isMoveDone(pfd, state.p_frame) then state.p_move = "idle"; state.p_frame = 0 end
+
+    state.p_health = clamp(state.p_health, 0, 100)
+    state.o_health = clamp(state.o_health, 0, 100)
+    state.p_meter = clamp(state.p_meter, 0, GAME_CONSTANTS.FLUX_CAP)
+    state.o_meter = clamp(state.o_meter, 0, GAME_CONSTANTS.FLUX_CAP)
+
+    local novelty = self:_estimateNovelty(state)
+    state.info_gain = novelty * (((state.o_move == "light") or (state.o_move == "walk_fwd")) and 1.0 or 0.4)
+    state.deception_value = ((state.o_move == "walk_fwd" or state.o_move == "idle") and (self.belief.respect_decay > 0.4)) and 0.8 or 0.0
+end
+
+function AI:loadWorldModel(weights)
+    if not self.config.world_model.enabled then
+        self.world_model_loaded = false
+        return false
+    end
+
+    local model = weights
+    if not model and type(rawget(_G, "WORLD_MODEL_WEIGHTS")) == "table" then
+        model = _G.WORLD_MODEL_WEIGHTS
+    end
+    if not model then
+        local d = self.config.world_model.feature_dim or 20
+        model = { W = {}, b = {} }
+        for i = 1, d do
+            model.W[i] = {}
+            for j = 1, d do
+                model.W[i][j] = (i == j) and 0.015 or 0
+            end
+            model.b[i] = 0
+        end
+    end
+
+    self.world_model = deepcopy(model)
+    self.world_model_loaded = true
+    return true
+end
+
+function AI:_initMuZeroModel()
+    if self.muzero then return self.muzero end
+
+    local md = self.config.muzero.latent_dim or 16
+    local m = {
+        repr_w = {}, repr_b = {},
+        dyn_state_w = {}, dyn_reward_w = {}, dyn_b = {},
+        val_w = {}, val_b = 0,
+        policy_w = {}, policy_b = {}
+    }
+
+    for i = 1, md do
+        m.repr_w[i] = {}
+        m.repr_b[i] = 0
+        m.dyn_state_w[i] = {}
+        m.dyn_reward_w[i] = 0
+        m.dyn_b[i] = 0
+        m.val_w[i] = (self.rng() * 2 - 1) * 0.08
+        for j = 1, 20 do
+            m.repr_w[i][j] = (self.rng() * 2 - 1) * 0.05
+        end
+        for j = 1, md + #ACTIONS * 2 do
+            m.dyn_state_w[i][j] = (self.rng() * 2 - 1) * 0.04
+        end
+        m.dyn_reward_w[i] = (self.rng() * 2 - 1) * 0.03
+    end
+
+    for _, a in ipairs(ACTIONS) do
+        m.policy_w[a] = {}
+        m.policy_b[a] = 0
+        for i = 1, md do m.policy_w[a][i] = (self.rng() * 2 - 1) * 0.08 end
+    end
+
+    self.muzero = m
+    return m
+end
+
+function AI:_muzeroRepresent(state)
+    if not self.config.muzero.enabled then return nil end
+    local m = self:_initMuZeroModel()
+    local x = self:_encodeWorldInput(state, "idle", "idle")
+    local z = {}
+    for i = 1, (self.config.muzero.latent_dim or 16) do
+        local acc = m.repr_b[i] or 0
+        local row = m.repr_w[i] or {}
+        for j = 1, math.min(20, #x) do acc = acc + (row[j] or 0) * (x[j] or 0) end
+        z[i] = math.tanh(acc)
+    end
+    return z
+end
+
+function AI:_muzeroPredict(latent)
+    if not latent then return nil end
+    local m = self:_initMuZeroModel()
+    local val = m.val_b or 0
+    for i = 1, #latent do val = val + (m.val_w[i] or 0) * (latent[i] or 0) end
+    val = math.tanh(val)
+
+    local logits = {}
+    local max_l = -1e9
+    for _, a in ipairs(ACTIONS) do
+        local s = m.policy_b[a] or 0
+        local wa = m.policy_w[a] or {}
+        for i = 1, #latent do s = s + (wa[i] or 0) * (latent[i] or 0) end
+        logits[a] = s
+        if s > max_l then max_l = s end
+    end
+
+    local denom = 0
+    for _, a in ipairs(ACTIONS) do
+        logits[a] = math.exp((logits[a] or 0) - max_l)
+        denom = denom + logits[a]
+    end
+    local policy = {}
+    for _, a in ipairs(ACTIONS) do policy[a] = (logits[a] or 0) / math.max(1e-6, denom) end
+
+    return val, policy
+end
+
+function AI:_muzeroDynamics(latent, action, opp_action)
+    if not latent then return nil, 0 end
+    local m = self:_initMuZeroModel()
+    local inp = {}
+    for i = 1, #latent do inp[#inp + 1] = latent[i] or 0 end
+    for _, a in ipairs(ACTIONS) do inp[#inp + 1] = (a == action and 1 or 0) end
+    for _, a in ipairs(ACTIONS) do inp[#inp + 1] = (a == opp_action and 1 or 0) end
+
+    local nxt, reward = {}, 0
+    for i = 1, #latent do
+        local acc = m.dyn_b[i] or 0
+        local row = m.dyn_state_w[i] or {}
+        for j = 1, #inp do acc = acc + (row[j] or 0) * (inp[j] or 0) end
+        nxt[i] = math.tanh(acc)
+        reward = reward + (m.dyn_reward_w[i] or 0) * nxt[i]
+    end
+    reward = math.tanh(reward)
+    return nxt, reward
+end
+
+function AI:_muzeroInference(state, action, opp_action)
+    if not self.config.muzero.enabled then return nil end
+    local z = self:_muzeroRepresent(state)
+    if action then z = select(1, self:_muzeroDynamics(z, action, opp_action or "idle")) end
+    local v, p = self:_muzeroPredict(z)
+    return { latent = z, value = v or 0, policy = p or {} }
+end
+
+function AI:_storeMuZeroTransition(state, action, opp_action, next_state, reward, policy_target)
+    if not self.config.muzero.enabled then return end
+    local r = self.muzero_replay
+    local pt = {}
+    if type(policy_target) == "table" then
+        local sum = 0
+        for _, a in ipairs(ACTIONS) do
+            local v = tonumber(policy_target[a]) or 0
+            pt[a] = math.max(0, v)
+            sum = sum + pt[a]
+        end
+        if sum > 0 then
+            for _, a in ipairs(ACTIONS) do pt[a] = pt[a] / sum end
+        else
+            for _, a in ipairs(ACTIONS) do pt[a] = 1 / #ACTIONS end
+        end
+    else
+        for _, a in ipairs(ACTIONS) do pt[a] = (a == (action or "idle")) and 1 or 0 end
+    end
+
+    r[#r + 1] = {
+        s = deepcopy(state),
+        a = action or "idle",
+        oa = opp_action or "idle",
+        ns = deepcopy(next_state),
+        reward = clamp(reward or 0, -1, 1),
+        policy_target = pt
+    }
+    local cap = self.config.muzero.replay_size or 12000
+    if #r > cap then table.remove(r, 1) end
+end
+
+function AI:trainMuZeroFromReplay(opts)
+    if not self.config.muzero.enabled then return { updates = 0, loss = 0, enabled = false } end
+    local cfg = opts or {}
+    local epochs = cfg.epochs or 1
+    local batch = cfg.batch_size or 64
+    local lr = cfg.lr or self.config.muzero.learning_rate or 0.0007
+    local replay = self.muzero_replay or {}
+    if #replay == 0 then return { updates = 0, loss = 0, enabled = true, empty = true } end
+
+    local m = self:_initMuZeroModel()
+    local total_loss, n = 0, 0
+    local unroll = math.max(1, self.config.muzero.unroll_steps or 1)
+
+    for _ = 1, epochs do
+        for _ = 1, math.min(batch, #replay) do
+            local idx = math.floor(self.rng() * #replay) + 1
+            local smp = replay[idx]
+            local z = self:_muzeroRepresent(smp.s)
+
+            local p_target = smp.policy_target or {}
+            local p_sum = 0
+            for _, a in ipairs(ACTIONS) do p_sum = p_sum + (p_target[a] or 0) end
+            if p_sum <= 0 then
+                for _, a in ipairs(ACTIONS) do p_target[a] = (a == smp.a) and 1 or 0 end
+                p_sum = 1
+            end
+            for _, a in ipairs(ACTIONS) do p_target[a] = (p_target[a] or 0) / p_sum end
+
+            local v_pred, p_pred = self:_muzeroPredict(z)
+            local v_tgt = math.tanh((self:evaluateState(smp.ns) or 0) / 100)
+            local value_err = (v_tgt - (v_pred or 0))
+
+            local v_raw = m.val_b or 0
+            for i = 1, #z do v_raw = v_raw + (m.val_w[i] or 0) * (z[i] or 0) end
+            local dv = value_err * (1 - math.tanh(v_raw)^2)
+            for i = 1, #z do
+                m.val_w[i] = (m.val_w[i] or 0) + lr * dv * (z[i] or 0)
+            end
+            m.val_b = (m.val_b or 0) + lr * dv
+
+            local p_loss = 0
+            for _, a in ipairs(ACTIONS) do
+                local pe = (p_target[a] or 0) - (p_pred[a] or 0)
+                p_loss = p_loss + pe * pe
+                local wa = m.policy_w[a] or {}
+                for i = 1, #z do wa[i] = (wa[i] or 0) + lr * pe * (z[i] or 0) end
+                m.policy_w[a] = wa
+                m.policy_b[a] = (m.policy_b[a] or 0) + lr * pe
+            end
+
+            local dyn_loss = 0
+            local reward_loss = 0
+            local z_step = z
+            for k = 0, unroll - 1 do
+                local step = replay[math.min(#replay, idx + k)]
+                if not step then break end
+
+                local z_next_pred, r_pred = self:_muzeroDynamics(z_step, step.a, step.oa)
+                local z_tgt = self:_muzeroRepresent(step.ns)
+                local r_tgt = step.reward or 0
+                local reward_err = r_tgt - (r_pred or 0)
+
+                local inp = {}
+                for i = 1, #z_step do inp[#inp + 1] = z_step[i] or 0 end
+                for _, a in ipairs(ACTIONS) do inp[#inp + 1] = (step.a == a and 1 or 0) end
+                for _, a in ipairs(ACTIONS) do inp[#inp + 1] = (step.oa == a and 1 or 0) end
+
+                local r_raw = 0
+                for i = 1, #z_next_pred do r_raw = r_raw + (m.dyn_reward_w[i] or 0) * (z_next_pred[i] or 0) end
+                local dr = reward_err * (1 - math.tanh(r_raw)^2)
+
+                for i = 1, #z_step do
+                    m.dyn_reward_w[i] = (m.dyn_reward_w[i] or 0) + lr * dr * (z_next_pred[i] or 0)
+                    local latent_err = ((z_tgt[i] or 0) - (z_next_pred[i] or 0))
+                    dyn_loss = dyn_loss + math.abs(latent_err)
+                    local row = m.dyn_state_w[i] or {}
+                    local zraw = m.dyn_b[i] or 0
+                    for j = 1, #inp do zraw = zraw + (row[j] or 0) * (inp[j] or 0) end
+                    local dz = latent_err * (1 - math.tanh(zraw)^2)
+                    for j = 1, #inp do row[j] = (row[j] or 0) + lr * dz * (inp[j] or 0) end
+                    m.dyn_state_w[i] = row
+                    m.dyn_b[i] = (m.dyn_b[i] or 0) + lr * dz
+                end
+
+                reward_loss = reward_loss + reward_err * reward_err
+                z_step = z_next_pred
+            end
+
+            dyn_loss = dyn_loss / math.max(1, unroll * #z)
+            local loss = value_err * value_err + reward_loss / math.max(1, unroll) + p_loss / math.max(1, #ACTIONS) + dyn_loss
+            total_loss = total_loss + loss
+            n = n + 1
+        end
+    end
+
+    self.muzero_stats.updates = (self.muzero_stats.updates or 0) + n
+    self.muzero_stats.last_loss = (n > 0) and (total_loss / n) or 0
+    self.logs.muzero[#self.logs.muzero + 1] = { frame = self.frame, updates = n, loss = self.muzero_stats.last_loss, replay = #replay, unroll = unroll }
+
+    return { updates = n, loss = self.muzero_stats.last_loss, replay = #replay, enabled = true, unroll = unroll }
+end
+
+function AI:_encodeWorldInput(state, action, opp_action)
+    local f = self:extractFeatures(state)
+    local action_oh = {}
+    for _, a in ipairs(ACTIONS) do action_oh[#action_oh + 1] = (a == action and 1 or 0) end
+    local opp_oh = {}
+    for _, a in ipairs(ACTIONS) do opp_oh[#opp_oh + 1] = (a == opp_action and 1 or 0) end
+
+    return {
+        f.health_diff or 0,
+        f.frame_advantage or 0,
+        f.corner_pressure or 0,
+        f.resource_availability or 0,
+        f.threat_count or 0,
+        f.risk_exposure or 0,
+        f.uncertainty or 0,
+        f.neutral_control or 0,
+        f.throw_threat or 0,
+        f.anti_air_readiness or 0,
+        state.px or 0,
+        state.ox or 0,
+        state.p_health or 100,
+        state.o_health or 100,
+        state.p_meter or 0,
+        state.o_meter or 0,
+        state.p_hitstun or 0,
+        state.o_hitstun or 0,
+        action_oh[6] or 0,
+        opp_oh[6] or 0
+    }
+end
+
+function AI:_worldModelStep(state, action, opp_action)
+    local m = self.world_model
+    if not m then return nil end
+    local x = self:_encodeWorldInput(state, action, opp_action)
+    local d = math.min(#x, self.config.world_model.feature_dim or #x)
+
+    local y = {}
+    local W = m.W or {}
+    local b = m.b or {}
+    for i = 1, d do
+        local acc = b[i] or 0
+        local row = W[i] or {}
+        for j = 1, d do acc = acc + (row[j] or 0) * (x[j] or 0) end
+        y[i] = math.tanh(acc)
+    end
+
+    local nxt = deepcopy(state)
+    local mix = clamp(self.config.world_model.uncertainty_mix or 0.35, 0.05, 0.95)
+    nxt.px = (state.px or 0) + (y[11] or 0) * 6 * mix
+    nxt.ox = (state.ox or 0) + (y[12] or 0) * 6 * mix
+    nxt.p_health = clamp((state.p_health or 100) + (y[13] or 0) * 3, 0, 100)
+    nxt.o_health = clamp((state.o_health or 100) + (y[14] or 0) * 3, 0, 100)
+    nxt.p_meter = clamp((state.p_meter or 0) + (y[15] or 0) * 4, 0, GAME_CONSTANTS.FLUX_CAP)
+    nxt.o_meter = clamp((state.o_meter or 0) + (y[16] or 0) * 4, 0, GAME_CONSTANTS.FLUX_CAP)
+    nxt.p_hitstun = clamp((state.p_hitstun or 0) + (y[17] or 0) * 2, 0, 30)
+    nxt.o_hitstun = clamp((state.o_hitstun or 0) + (y[18] or 0) * 2, 0, 30)
+    nxt.uncertainty = clamp(0.7 * (state.uncertainty or self.config.observation_noise) + 0.3 * math.abs(y[7] or 0), 0, 1)
+    return nxt
+end
+
+function AI:_predictFrames(base_state, action, opp_action, frames)
+    local horizon = math.min(frames or 1, self.config.world_model.horizon_frames or 24)
+    local state = deepcopy(base_state)
+    self.world_model_stats.calls = self.world_model_stats.calls + 1
+
+    for _ = 1, horizon do
+        local pred = self:_worldModelStep(state, action, opp_action)
+        if not pred then
+            self.world_model_stats.fallback = self.world_model_stats.fallback + 1
+            pred = self:_simulateActionSequence(state, action, opp_action, 1)
+        end
+        state = pred
+        if state.p_health <= 0 or state.o_health <= 0 then break end
+    end
+    return state
+end
+
+function AI:_rolloutState(state, action, opp_action, frames)
+    if self.config.world_model.use_for_search and self.world_model_loaded then
+        return self:_predictFrames(state, action, opp_action, frames)
+    end
+    return self:_simulateActionSequence(state, action, opp_action, frames)
+end
+
+function AI:_simulateActionSequence(base_state, my_action, opp_action, frames)
+    local state = deepcopy(base_state)
+    self:_applyActionToChar(state, "opp", my_action)
+    self:_applyActionToChar(state, "plr", opp_action)
+
+    if my_action == "special" then
+        if (state.o_meter or 0) >= 50 then state.o_meter = clamp(state.o_meter - 50, 0, 100) else state.o_move = "idle" end
+    end
+
+    for _ = 1, frames do
+        self:_advanceFrame(state)
+        if state.p_health <= 0 or state.o_health <= 0 then break end
+    end
+    return state
+end
+
+function AI:_isQuiescent(state)
+    if (state.p_hitstun or 0) > 0 or (state.o_hitstun or 0) > 0 then return false end
+    if (state.p_blockstun or 0) > 0 or (state.o_blockstun or 0) > 0 then return false end
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+    if dist < 60 then return false end
+    if (state.px or 0) < 70 then return false end
+    return true
+end
+
+function AI:_quiescence(state, alpha, beta, depth_left)
+    local stand_pat = self:evaluateState(state)
+    if depth_left <= 0 then return stand_pat end
+    if stand_pat >= beta then return beta end
+    if stand_pat > alpha then alpha = stand_pat end
+
+    local noisy = { "light", "heavy", "special", "throw" }
+    for _, a in ipairs(noisy) do
+        local child = self:_rolloutState(state, a, "block", 6)
+        local score = -self:_quiescence(child, -beta, -alpha, depth_left - 1)
+        if score >= beta then return beta end
+        if score > alpha then alpha = score end
+    end
+    return alpha
+end
+
+
+function AI:_bayesMean(bucket)
+    if not bucket then return 0.5 end
+    return bucket.alpha / math.max(1, (bucket.alpha + bucket.beta))
+end
+
+function AI:_reactionQueuePush(action)
+    self.reaction_queue[#self.reaction_queue + 1] = action
+    if #self.reaction_queue > 5 then table.remove(self.reaction_queue, 1) end
+end
+
+function AI:_reactionQueueMostLikely()
+    if #self.reaction_queue == 0 then return nil end
+    local c = {}
+    for _, a in ipairs(self.reaction_queue) do c[a] = (c[a] or 0) + 1 end
+    local best, n = nil, -1
+    for a, k in pairs(c) do if k > n then best, n = a, k end end
+    return best
+end
+
+function AI:_macroToPrimitive(macro_name)
+    return deepcopy(MACRO_ACTIONS[macro_name] or { macro_name })
+end
+
+function AI:_legalActionSet(state)
+    local out = {}
+    for _, a in ipairs(ACTIONS) do out[#out + 1] = a end
+    for k, _ in pairs(MACRO_ACTIONS) do out[#out + 1] = "macro:" .. k end
+    return out
+end
+
+function AI:_ngramActionBias(action, phase)
+    local st = self.player_model.short_term_window or {}
+    local n = #st
+    if n < 2 then return 1.0 end
+
+    local ngram_matches = 0
+    local total_matches = 0
+    local ctx1 = st[n] or "idle"
+    local ctx2 = st[n - 1] or "idle"
+
+    for i = 3, n do
+        if st[i - 1] == ctx1 then
+            total_matches = total_matches + 1
+            if st[i] == action then ngram_matches = ngram_matches + 1 end
+        end
+        if st[i - 2] == ctx2 and st[i - 1] == ctx1 then
+            total_matches = total_matches + 1
+            if st[i] == action then ngram_matches = ngram_matches + 1 end
+        end
+    end
+
+    local cond_key = string.format("%s|%s|%s", self.last_action or "idle", phase or "neutral", action)
+    local cond = self.player_model.conditional[cond_key] or 0
+    local long = self.player_model.long_term_counts[action] or 0
+
+    local freq = (ngram_matches + 0.35 * cond + 0.2 * long + 1.0) / math.max(1.0, (total_matches + 0.35 * cond + 0.2 * long + #ACTIONS))
+    return clamp(0.7 + 2.0 * freq, 0.65, 1.55)
+end
+
+function AI:_mctsDecayTree(node, factor, depth, max_depth)
+    if not node then return end
+    local d = depth or 0
+    local md = max_depth or 2
+    local f = factor or 0.9
+
+    node.N = math.max(0, (node.N or 0) * f)
+    node.W = (node.W or 0) * f
+    if d >= md then return end
+    for _, child in pairs(node.children or {}) do
+        self:_mctsDecayTree(child, f, d + 1, md)
+    end
+end
+
+function AI:_iterativeDeepeningSearch(root, max_depth, deadline)
+    local best_score, best_action = -1e9, "idle"
+    local best_moves = { "idle" }
+    local asp_window = 35
+
+    for d = 2, math.max(2, max_depth) do
+        if now_ms() > deadline then break end
+
+        local alpha, beta = -1e9, 1e9
+        if d > 2 then
+            alpha = best_score - asp_window
+            beta = best_score + asp_window
+        end
+
+        local score, action, moves = self:_negaExpectimax(deepcopy(root), d, alpha, beta, deadline, d)
+        if score <= alpha or score >= beta then
+            score, action, moves = self:_negaExpectimax(deepcopy(root), d, -1e9, 1e9, deadline, d)
+            asp_window = math.min(200, asp_window * 1.35)
+        else
+            asp_window = math.max(20, asp_window * 0.95)
+        end
+
+        if action then
+            best_score, best_action = score, action
+            best_moves = moves or best_moves
+        end
+    end
+
+    return best_score, best_action, best_moves
+end
+
+function AI:_policyPrior(state, action)
+    local base = 0.1
+    if action == "light" then base = base + 0.18 end
+    if action == "throw" then base = base + 0.12 end
+    if action == "special" and (state.o_meter or 0) >= 50 then base = base + 0.15 end
+    if type(action) == "string" and action:match("^macro:") then base = base + 0.08 end
+    if self.nn and self.config.hybrid.critic_enabled and self.nn.policy_w then
+        base = base + 0.02
+    end
+
+    local phase = self:_currentPhase(state)
+    local ngram_bias = self:_ngramActionBias(action, phase)
+    local confidence = self.player_model.confidence[action] or 0.5
+    base = base * ngram_bias * (0.85 + 0.3 * confidence)
+
+    if self.config.muzero.enabled then
+        local inf = self:_muzeroInference(state)
+        if inf and inf.policy then
+            local p = inf.policy[action] or (1 / math.max(1, #ACTIONS))
+            local pb = clamp(self.config.muzero.policy_blend or 0.25, 0, 0.7)
+            base = (1 - pb) * base + pb * p
+        end
+    end
+
+    return clamp(base, 0.01, 0.95)
+end
+
+function AI:_applyActionOrMacro(state, action, opp_action, frames)
+    if type(action) == "string" and action:match("^macro:") then
+        local name = action:gsub("^macro:", "")
+        local seq = self:_macroToPrimitive(name)
+        local temp = deepcopy(state)
+        for _, step in ipairs(seq) do
+            temp = self:_rolloutState(temp, step, opp_action, math.max(2, math.floor(frames / math.max(1, #seq))))
+            if temp.p_health <= 0 or temp.o_health <= 0 then break end
+        end
+        return temp
+    end
+    return self:_rolloutState(state, action, opp_action, frames)
+end
+
+function AI:_mctsValue(state)
+    local v = self:evaluateState(state)
+    local base = math.tanh(v / 100)
+    if self.config.muzero.enabled then
+        local inf = self:_muzeroInference(state)
+        if inf then
+            local blend = clamp(self.config.muzero.value_blend or 0.35, 0, 0.8)
+            base = (1 - blend) * base + blend * (inf.value or 0)
+        end
+    end
+    return base
+end
+
+function AI:_graphStatsForNode(node)
+    if not node then return nil end
+    if node.graph_key and self.mcts_graph[node.graph_key] then
+        return self.mcts_graph[node.graph_key]
+    end
+    return nil
+end
+
+function AI:_graphAwareQ(node)
+    local gs = self:_graphStatsForNode(node)
+    if gs and gs.N and gs.N > 0 then return gs.W / gs.N end
+    if node.N > 0 then return node.W / node.N end
+    return 0
+end
+
+function AI:_mctsWidenLimit(depth, visits)
+    if not self.config.mcts.progressive_widening then return self.config.max_branching end
+    local exp = self.config.mcts.widening_exponent or 1.2
+    local base = self.config.mcts.widening_base or 2
+    local by_depth = math.max(2, math.floor(math.pow(math.max(1, depth), exp)))
+    local by_visits = math.max(2, math.floor(math.pow(math.max(1, visits or 1), 0.5)))
+    return math.max(base, math.min(self.config.max_branching, math.max(by_depth, by_visits)))
+end
+
+function AI:_mctsMaybeWiden(node, depth)
+    if not node or not node.unexpanded_actions then return end
+    local allowed = self:_mctsWidenLimit(depth or 1, node.N or 1)
+    local cur = 0
+    for _ in pairs(node.children or {}) do cur = cur + 1 end
+    while cur < allowed and #node.unexpanded_actions > 0 do
+        local a = table.remove(node.unexpanded_actions, 1)
+        if not node.children[a] then
+            node.children[a] = {
+                parent = node,
+                action = a,
+                state = nil,
+                N = 0,
+                W = 0,
+                P = self:_policyPrior(node.state, a),
+                expanded = false,
+                children = {},
+                unexpanded_actions = nil,
+                vloss = 0
+            }
+            cur = cur + 1
+        end
+    end
+end
+
+function AI:_rolloutCacheGet(key)
+    local c = self.rollout_cache[key]
+    if not c then return nil end
+    return deepcopy(c)
+end
+
+function AI:_rolloutCachePut(key, state)
+    if not key then return end
+    local maxn = self.config.mcts.rollout_cache_size or 1500
+    if not self.rollout_cache[key] then
+        self.rollout_cache_order[#self.rollout_cache_order + 1] = key
+    end
+    self.rollout_cache[key] = deepcopy(state)
+    while #self.rollout_cache_order > maxn do
+        local old = table.remove(self.rollout_cache_order, 1)
+        self.rollout_cache[old] = nil
+    end
+end
+
+function AI:_mctsSelectChild(node)
+    local best, best_score = nil, -1e9
+    local total = math.max(1, node.N)
+    local forced = self.config.mcts.forced_playouts or 10
+
+    for action, child in pairs(node.children) do
+        local q_tree = self:_graphAwareQ(child)
+        local rave = self.rave_stats[action] or { N = 0, W = 0 }
+        local q_rave = (rave.N > 0) and (rave.W / rave.N) or 0
+        local blend = rave.N / math.max(1, rave.N + (child.N or 0) + 8)
+        local q = (1 - blend) * q_tree + blend * q_rave
+
+        local forced_bonus = ((child.N or 0) < forced) and (forced - (child.N or 0)) * 0.5 or 0
+        local novelty = self:_estimateNovelty(child.state or node.state)
+        local c = self.config.mcts.c_puct * (1 + 0.22 * novelty)
+        local u = c * child.P * math.sqrt(total) / (1 + child.N)
+        local vloss = child.vloss or 0
+        local score = q + u + forced_bonus - vloss
+        if score > best_score then best, best_score = child, score end
+    end
+    return best
+end
+
+function AI:_mctsExpand(node)
+    if node.expanded then
+        self:_mctsMaybeWiden(node, node.depth or 1)
+        return
+    end
+
+    local legal = self:_legalActionSet(node.state)
+    local candidates = {}
+    for _, a in ipairs(legal) do
+        local pruned = false
+        if not tostring(a):match("^macro:") then
+            pruned = self:_pruneAction(node.state, a)
+        end
+        if not pruned then
+            candidates[#candidates + 1] = a
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return self:_policyPrior(node.state, a) > self:_policyPrior(node.state, b)
+    end)
+
+    node.unexpanded_actions = candidates
+    node.children = node.children or {}
+    node.expanded = true
+    self:_mctsMaybeWiden(node, node.depth or 1)
+end
+
+function AI:_mctsSimulateLeaf(node)
+    local branches, _ = self:_predictOpponentBranches(node.state)
+    local opp_action = branches[1] and branches[1].action or "idle"
+
+    local pkey = node.parent and self:_hashState(node.parent.state) or "root"
+    local cache_key = string.format("%s|%s|%s|%d", pkey, tostring(node.action), tostring(opp_action), self.config.mcts.rollout_frames)
+    local cached = self:_rolloutCacheGet(cache_key)
+    if cached then
+        node.state = cached
+    else
+        node.state = self:_applyActionOrMacro(node.parent.state, node.action, opp_action, self.config.mcts.rollout_frames)
+        self:_rolloutCachePut(cache_key, node.state)
+    end
+
+    node.graph_key = self:_hashState(node.state)
+    if not self.mcts_graph[node.graph_key] then
+        self.mcts_graph[node.graph_key] = { N = 0, W = 0 }
+    end
+    return self:_mctsValue(node.state)
+end
+
+function AI:_mctsBackup(node, value)
+    local cur = node
+    local v = value
+    while cur do
+        cur.vloss = math.max(0, (cur.vloss or 0) - (self.config.mcts.virtual_loss or 2.0))
+        cur.N = cur.N + 1
+        cur.W = cur.W + v
+
+        if cur.graph_key then
+            local gs = self.mcts_graph[cur.graph_key] or { N = 0, W = 0 }
+            gs.N = gs.N + 1
+            gs.W = gs.W + v
+            self.mcts_graph[cur.graph_key] = gs
+        end
+
+        if cur.action then
+            local rs = self.rave_stats[cur.action] or { N = 0, W = 0 }
+            rs.N = rs.N + 1
+            rs.W = rs.W + v
+            self.rave_stats[cur.action] = rs
+        end
+
+        v = -v
+        cur = cur.parent
+    end
+end
+
+function AI:mctsSearch(root_state, budget_sims)
+    local root_key = self:_hashState(root_state)
+    local root
+
+    if self.mcts_root_cache and self.mcts_root_cache.key == root_key and self.mcts_root_cache.node then
+        root = self.mcts_root_cache.node
+        root.parent = nil
+        root.action = nil
+        root.state = deepcopy(root_state)
+        self:_mctsDecayTree(root, self.config.mcts.root_reuse_decay or 0.99, 0, 3)
+    else
+        root = { state = deepcopy(root_state), parent = nil, action = nil, N = 0, W = 0, P = 1, expanded = false, children = {}, depth = 1, vloss = 0 }
+    end
+
+    if not root.expanded then self:_mctsExpand(root) end
+
+    if next(root.children) and self.config.muzero.enabled then
+        local eps = clamp(self.config.muzero.dirichlet_eps or 0.25, 0, 0.5)
+        local alpha = math.max(0.03, self.config.muzero.dirichlet_alpha or 0.3)
+        local noise = {}
+        local sum = 0
+        for a, _ in pairs(root.children) do
+            local n = math.pow(math.max(1e-6, self.rng()), 1 / alpha)
+            noise[a] = n
+            sum = sum + n
+        end
+        for a, child in pairs(root.children) do
+            local eta = (noise[a] or 0) / math.max(sum, 1e-6)
+            child.P = clamp((1 - eps) * (child.P or 0) + eps * eta, 0.001, 0.999)
+        end
+    end
+
+    for _ = 1, budget_sims do
+        local node = root
+        local depth = 1
+        while node.expanded and next(node.children) do
+            self:_mctsMaybeWiden(node, depth)
+            local next_node = self:_mctsSelectChild(node)
+            if not next_node then break end
+            next_node.vloss = (next_node.vloss or 0) + (self.config.mcts.virtual_loss or 2.0)
+            node = next_node
+            depth = depth + 1
+            node.depth = depth
+            if node.state == nil and node.parent and node.action then break end
+        end
+
+        if node.parent and node.state == nil then
+            local value = self:_mctsSimulateLeaf(node)
+            self:_mctsExpand(node)
+            self:_mctsBackup(node, value)
+        else
+            local value = self:_mctsValue(node.state)
+            self:_mctsBackup(node, value)
+        end
+    end
+
+    local best_action, best_visits, best_child = "idle", -1, nil
+    local top, denom = {}, 0
+    for a, child in pairs(root.children) do
+        local visits = child.N or 0
+        top[#top + 1] = { action = a, visits = visits, q = self:_graphAwareQ(child) }
+        denom = denom + math.max(0, visits)
+        if visits > best_visits then best_visits = visits; best_action = a; best_child = child end
+    end
+    table.sort(top, function(x, y) return x.visits > y.visits end)
+
+    local base_temp = math.max(0, self.config.mcts.temperature or 0)
+    local tmin = math.max(0, self.config.mcts.temperature_min or 0)
+    local tdec = clamp(self.config.mcts.temperature_decay or 0.995, 0.9, 1.0)
+    local temp = math.max(tmin, base_temp * math.pow(tdec, math.max(0, self.frame or 0)))
+    if temp > 0 and #top > 0 then
+        local logits, zsum = {}, 0
+        for i, row in ipairs(top) do
+            local p = math.pow(math.max(1e-6, row.visits / math.max(1, denom)), 1 / math.max(1e-6, temp))
+            logits[i] = p
+            zsum = zsum + p
+        end
+        local r = self.rng() * math.max(1e-6, zsum)
+        local acc = 0
+        for i, row in ipairs(top) do
+            acc = acc + (logits[i] or 0)
+            if r <= acc then best_action = row.action; break end
+        end
+    end
+
+    if best_child then
+        best_child.parent = nil
+        self.mcts_root_cache = { key = self:_hashState(best_child.state or root_state), node = best_child }
+        self.prev_root_score = (best_visits > 0) and (self:_graphAwareQ(best_child) * 100) or (self.prev_root_score or 0)
+    else
+        self.mcts_root_cache = { key = root_key, node = root }
+    end
+
+    self.logs.mcts[#self.logs.mcts + 1] = { frame = self.frame, sims = budget_sims, best = best_action, top = top }
+    return best_action, top
+end
+
+function AI:_predictOpponentBranches(obs)
+    if not self.config.ablations.prediction then
+        return { { action = "idle", p = 1.0 } }, { confidence = 0.2, reason = "ablation" }
+    end
+
+    local phase = self:_currentPhase(obs)
+    local candidates = { "light", "block", "walk_back", "jump", "throw" }
+    local branches = {}
+    local total = 0
+    for _, a in ipairs(candidates) do
+        local key = string.format("%s|%s|%s", self.last_action or "idle", phase, a)
+        local c = self.player_model.conditional[key] or self.player_model.long_term_counts[a] or 1
+        total = total + c
+        branches[#branches + 1] = { action = a, p = c }
+    end
+    for _, b in ipairs(branches) do b.p = b.p / math.max(total, 1e-6) end
+
+    local p_jump = self:_bayesMean(self.belief.bayes.jump_after_block_light)
+    local cm = self.player_model.conditioning_memory
+    local adapt = self.cross_match_memory.adaptation_speed["global"] or 0.5
+    local meter_threat = ((obs.p_meter or 0) >= GAME_CONSTANTS.SPECIAL_FLUX_COST) and 1 or 0
+    for _, b in ipairs(branches) do
+        if b.action == "jump" then b.p = b.p * (0.6 + p_jump + 0.08 * (cm.jump_after_block_light or 0)) end
+        if b.action == "block" then b.p = b.p * (1 + 0.25 * meter_threat + 0.2 * adapt) end
+        if b.action == "throw" and (cm.no_throw_tech_streak or 0) > 2 then b.p = b.p * 1.15 end
+    end
+    local sum = 0
+    for _, b in ipairs(branches) do sum = sum + b.p end
+    for _, b in ipairs(branches) do b.p = b.p / math.max(sum, 1e-6) end
+
+    local persona = "balanced"
+    if (self.player_model.style.aggression or 0.5) > 0.62 then persona = "aggressive" end
+    if (self.player_model.style.backdash_frequency or 0.5) > 0.58 then persona = "defensive" end
+
+    local gen_prior = { light = 1.0, block = 1.0, walk_back = 1.0, jump = 1.0, throw = 1.0 }
+    if persona == "aggressive" then
+        gen_prior.light, gen_prior.throw = 1.25, 1.15
+        gen_prior.block = 0.9
+    elseif persona == "defensive" then
+        gen_prior.block, gen_prior.walk_back = 1.25, 1.2
+        gen_prior.throw = 0.9
+    end
+    for _, b in ipairs(branches) do b.p = b.p * (gen_prior[b.action] or 1.0) end
+
+    local sum2 = 0
+    for _, b in ipairs(branches) do sum2 = sum2 + b.p end
+    for _, b in ipairs(branches) do b.p = b.p / math.max(sum2, 1e-6) end
+
+    local hp_dist = self:humanBiasedPolicy(obs, 1.15)
+    local hconf = clamp(self.human_policy.confidence or 0, 0, 1)
+    for _, b in ipairs(branches) do
+        local hp = hp_dist[b.action] or (1 / #branches)
+        b.p = (1 - 0.35 * hconf) * b.p + (0.35 * hconf) * hp
+    end
+    local sum3 = 0
+    for _, b in ipairs(branches) do sum3 = sum3 + b.p end
+    for _, b in ipairs(branches) do b.p = b.p / math.max(sum3, 1e-6) end
+
+    local conf = clamp(0.2 + 0.6 * (self.belief.confidence or 0.5) + 0.2 * hconf, 0.1, 0.98)
+    return branches, { confidence = conf, reason = "genbr_persona_bayes_humanpolicy", persona = persona, human_confidence = hconf }
+end
+
+function AI:_isLosingPosition(state, action, horizon)
+    local h = math.max(1, horizon or 3)
+    local child = self:_rolloutState(state, action, "light", 3)
+    local v = self:evaluateState(child)
+    if v < -18 then return true end
+    if h <= 1 then return false end
+
+    local worst = 1e9
+    local probes = { "light", "heavy", "throw" }
+    for _, oa in ipairs(probes) do
+        local n = self:_rolloutState(state, action, oa, 4)
+        local sc = self:evaluateState(n)
+        if sc < worst then worst = sc end
+    end
+    return worst < -24
+end
+
+function AI:_smartPrune(state, action, depth)
+    local fd = FRAME_DATA[action] or FRAME_DATA.idle
+    if (fd.on_block or 0) <= -12 and (state.frame_advantage or 0) < -2 then
+        return true, "unsafe_block"
+    end
+    if depth and depth >= 2 and self:_isLosingPosition(state, action, 3) then
+        return true, "leads_to_loss"
+    end
+    return false, ""
+end
+
+function AI:_killConfirmBonus(state, action)
+    if action ~= "heavy" and action ~= "special" and action ~= "throw" then return 0 end
+    local kill, traj = self:killConfirmPercent(state.p_health or 0, 34, 1.22, 43, { x = state.px or 0, y = state.py or GAME_CONSTANTS.PLATFORM_Y })
+    if not kill then return 0 end
+    local urgency = clamp((12 - (traj.frames_to_death or 12)) / 12, 0, 1)
+    return 120 * urgency
+end
+
+function AI:_moveOrder(state, action)
+    local PRO_MOVE_BONUS = {
+        ["throw"] = 150,
+        ["light"] = 120,
+        ["special"] = 90,
+        ["block"] = 60,
+    }
+    return (PRO_MOVE_BONUS[action] or 0) + self:_killConfirmBonus(state, action)
+end
+
+function AI:_pruneAction(state, action)
+    if not self.config.ablations.pruning then return false, "" end
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+    local fd = FRAME_DATA[action] or FRAME_DATA.idle
+
+    if action == "heavy" and (state.frame_advantage or 0) < -1 then return true, "negative_frames_known" end
+    if action == "light" and dist > (GAME_CONSTANTS.ATTACK_RANGE_W + 60) then return true, "whiff_distance" end
+    if action == "heavy" and dist > (GAME_CONSTANTS.ATTACK_RANGE_W + 90) then return true, "whiff_distance" end
+    if action == "throw" and dist > 24 then return true, "throw_out_of_range" end
+    if action == "special" and ((state.o_meter or 0) < GAME_CONSTANTS.SPECIAL_FLUX_COST or dist > (GAME_CONSTANTS.ATTACK_RANGE_W + 120)) then return true, "resource_or_whiff" end
+
+    local anti_air_loaded = ((state.o_move == "light") and (FRAME_DATA.light.anti_air))
+    if action == "jump" and anti_air_loaded then return true, "jump_vs_loaded_anti_air" end
+
+    local prune_bias = (self.active_phase_policy and self.active_phase_policy.pruning_bias) or 1.0
+    if fd.on_block and fd.on_block <= (-8 * prune_bias) and self.config.risk_tolerance < 0.6 then return true, "unsafe_on_block" end
+    return false, ""
+end
+
+function AI:_moveOrderHeuristic(state, action, depth)
+    local score = self:_moveOrder(state, action)
+    if action == "special" then score = score + 90 end
+    if action == "heavy" then score = score + 70 end
+    if action == "light" then score = score + 60 end
+    if action == "throw" then score = score + 50 end
+    if action == "block" then score = score + 20 end
+
+    local fd = FRAME_DATA[action] or FRAME_DATA.idle
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+
+    if fd.startup and fd.startup > 0 then
+        score = score + clamp(16 - fd.startup, -20, 16)
+    end
+    if fd.on_block then
+        if fd.on_block >= -2 then score = score + 26
+        elseif fd.on_block >= -5 then score = score + 12
+        else score = score - 8 end
+    end
+
+    if fd.damage and fd.damage > 0 then
+        local in_range = self:_actionInRange(state, action)
+        score = score + (in_range and (fd.damage * 1.8) or -(fd.damage * 0.35))
+    end
+
+    if action == "throw" then
+        if dist < 28 then score = score + 35 else score = score - 20 end
+    elseif action == "light" then
+        if dist < (GAME_CONSTANTS.ATTACK_RANGE_W + 12) then score = score + 12 else score = score - 6 end
+    elseif action == "heavy" then
+        if dist < (GAME_CONSTANTS.ATTACK_RANGE_W + 30) then score = score + 10 else score = score - 12 end
+    end
+
+    local cancel_count = 0
+    if type(fd.cancel) == "table" then
+        for _, frames in pairs(fd.cancel) do
+            if type(frames) == "table" and #frames > 0 then cancel_count = cancel_count + 1 end
+        end
+    end
+    score = score + cancel_count * 8
+
+    score = score + (self.history_heuristic[action] or 0)
+    local killers = self.killer_moves[depth]
+    if killers then
+        if killers[1] == action then score = score + 1000 end
+        if killers[2] == action then score = score + 500 end
+    end
+
+    return score
+end
+
+function AI:_negaExpectimax(state, depth, alpha, beta, deadline_ms, root_depth)
+    if now_ms() > deadline_ms then return self:evaluateState(state), "time_cutoff" end
+
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+    local ext, red = 0, 0
+    if (state.p_hitstun or 0) > 0 then ext = ext + 1 end
+    if (state.p_blockstun or 0) > 0 or (state.o_blockstun or 0) > 0 then ext = ext + 1 end
+    if (state.frame_advantage or 0) > 1 then ext = ext + 1 end
+    if (state.px or 0) < 80 then ext = ext + 1 end
+    if dist < 55 then red = red + 1 end
+    if dist > 220 then red = red + 1 end
+
+    local effective_depth = depth + ext - red
+    if effective_depth <= 0 then
+        if self.config.ablations.quiescence and not self:_isQuiescent(state) then
+            return self:_quiescence(state, alpha, beta, self.config.quiescence_depth), "quiescence"
+        end
+        return self:evaluateState(state), "leaf"
+    end
+
+    local key = self:_hashState(state)
+    if self.config.ablations.transposition then
+        local tt = self.transposition[key]
+        if tt and tt.depth >= effective_depth then
+            if tt.bound == "exact" then return tt.eval, "tt_exact" end
+            if tt.bound == "lower" and tt.eval > alpha then alpha = tt.eval end
+            if tt.bound == "upper" and tt.eval < beta then beta = tt.eval end
+            if alpha >= beta then return tt.eval, "tt_cutoff" end
+        end
+    end
+
+    local branches, _ = self:_predictOpponentBranches(state)
+    local moves = {}
+    local branching_cap = self:_branchingLimit(effective_depth)
+    for i = 1, math.min(#ACTIONS, branching_cap) do
+        local a = ACTIONS[i]
+        local pruned, reason = self:_pruneAction(state, a)
+        if not pruned then
+            local sp, sr = self:_smartPrune(state, a, depth)
+            if sp then pruned, reason = true, sr end
+        end
+        if pruned then
+            self.logs.pruning[#self.logs.pruning + 1] = { frame = self.frame, depth = depth, action = a, reason = reason }
+        else
+            moves[#moves + 1] = a
+        end
+    end
+
+    if self.config.ablations.move_ordering then
+        table.sort(moves, function(a, b)
+            return self:_moveOrderHeuristic(state, a, depth) > self:_moveOrderHeuristic(state, b, depth)
+        end)
+    end
+
+    local tt_move = (self.transposition[key] and self.transposition[key].best_action) or nil
+    local pv_move = self.search_pv[effective_depth]
+    local function promote(arr, mv)
+        if not mv then return end
+        for i = 1, #arr do
+            if arr[i] == mv then
+                table.remove(arr, i)
+                table.insert(arr, 1, mv)
+                return
+            end
+        end
+    end
+    promote(moves, tt_move)
+    promote(moves, pv_move)
+
+    local best_val, best_action = -1e12, (moves[1] or "idle")
+    local original_alpha = alpha
+
+    for mi, action in ipairs(moves) do
+        local exp_val = 0
+        for _, br in ipairs(branches) do
+            local child = self:_rolloutState(state, action, br.action, 6)
+            child.uncertainty = self:_propagateUncertainty(state, action, br.p)
+            local robust_pen = child.uncertainty * ((self.timescale.match_plan == "low_variance_closeout") and 1.2 or 0.8)
+
+            local static_est = self:evaluateState(child) - robust_pen
+            local phase_margin = 10 * ((self.active_phase_policy and self.active_phase_policy.pruning_bias) or 1.0)
+            local root_anchor = self.prev_root_score or 0
+            local dynamic_margin = phase_margin + math.abs(root_anchor) * 0.04
+            local score
+            if (static_est < (alpha - dynamic_margin) or static_est < (root_anchor - dynamic_margin)) and effective_depth >= 3 then
+                score = static_est
+                self.logs.pruning[#self.logs.pruning + 1] = { frame = self.frame, depth = depth, action = action, reason = "heavy_loss_avoidance" }
+            else
+                score = -self:_negaExpectimax(child, effective_depth - 1, -beta, -alpha, deadline_ms, root_depth)
+                score = score - robust_pen
+            end
+            exp_val = exp_val + br.p * score
+        end
+
+        if exp_val > best_val then best_val, best_action = exp_val, action end
+        if exp_val > alpha then alpha = exp_val end
+        if alpha >= beta then
+            local k = self.killer_moves[depth] or {}
+            if k[1] ~= action then k[2] = k[1]; k[1] = action; self.killer_moves[depth] = k end
+            self.history_heuristic[action] = (self.history_heuristic[action] or 0) + depth * depth
+            break
+        end
+    end
+
+    if self.config.ablations.transposition then
+        local bound = "exact"
+        if best_val <= original_alpha then bound = "upper" end
+        if best_val >= beta then bound = "lower" end
+        self.transposition[key] = { eval = best_val, depth = effective_depth, bound = bound, best_action = best_action }
+    end
+
+    self.search_pv[effective_depth] = best_action
+
+    if depth == root_depth then return best_val, best_action, moves end
+    return best_val
+end
+
+function AI:_openingBookAction(obs)
+    if self.frame > 180 then return nil end
+    if self.timescale.match_plan ~= "data_gathering" then return nil end
+    local dist = math.abs((obs.ox or 0) - (obs.px or 0))
+    local bucket = (dist > 180 and "far") or (dist > 70 and "mid") or "close"
+    local seq = self.opening_book[string.format("neutral|%s", bucket)]
+    if not seq or #seq == 0 then return nil end
+    return seq[((math.floor(self.frame / 30)) % #seq) + 1]
+end
+
+function AI:_timeBudgetMs(obs)
+    local budget = self.config.decision_budget_ms
+    if (obs.p_health or 0) < 20 or (obs.o_health or 0) < 20 then budget = budget + 2.0 end
+    if (obs.p_hitstun or 0) > 0 or (obs.p_blockstun or 0) > 0 then budget = budget + 1.5 end
+    if self.player_model.style.tilt_level > 0.6 then budget = budget + 0.8 end
+    if self.meta_controller.curriculum_stage > 1 then budget = budget + 0.4 end
+    return math.max(self.config.emergency_budget_ms, budget)
+end
+
+function AI:_synthesizeCounterStyle()
+    local style = self.player_model.style
+    local out = { name = "defensive-neutral hybrid", risk_tolerance = 0.45 }
+    if style.aggression > 0.65 then
+        out.name = "meter-denial pressure"
+        out.risk_tolerance = 0.55
+    elseif style.backdash_frequency > 0.55 then
+        out.name = "delayed aggression"
+        out.risk_tolerance = 0.5
+    end
+    if style.tilt_level > 0.6 then
+        out.name = "tilt-punish stable"
+        out.risk_tolerance = 0.4
+    end
+    return out
+end
+
+function AI:_classifyState(obs)
+    local dist = math.abs((obs.ox or 0) - (obs.px or 0))
+    local my_hp = self.opponent.health or obs.o_health or 100
+    local opp_hp = self.player.health or obs.p_health or 100
+    local hp_delta = my_hp - opp_hp
+    local tleft = math.max(0, 3600 - (self.timescale.round_clock or 0))
+
+    local label = "neutral"
+    if (obs.p_hitstun or 0) > 0 or (obs.o_hitstun or 0) > 0 then label = "scramble" end
+    if (obs.p_hitstun or 0) > 12 and dist < 70 then label = "advantage" end
+    if (obs.o_hitstun or 0) > 12 and dist < 70 then label = "disadvantage" end
+    if dist < 50 and ((obs.p_hitstun or 0) > 0 or (obs.p_blockstun or 0) > 0) then label = "knockdown" end
+    if my_hp <= 25 or opp_hp <= 25 then label = "kill_range" end
+    if tleft < 600 and math.abs(hp_delta) < 18 then label = "time_pressure" end
+
+    local conf = clamp(0.55 + ((dist < 80) and 0.1 or 0) + (math.abs(hp_delta) > 20 and 0.1 or 0), 0.4, 0.95)
+    self.state_classifier.last = label
+    self.state_classifier.confidence = conf
+    self.logs.classifier[#self.logs.classifier + 1] = { frame = self.frame, label = label, confidence = conf, dist = dist, hp_delta = hp_delta }
+    return label, conf
+end
+
+function AI:_updateStrategicLayer(obs, state_label)
+    if self.frame - (self.strategic.last_update_frame or 0) < 30 then return self.strategic end
+    local hp_delta = (self.opponent.health or 0) - (self.player.health or 0)
+    local meter_delta = (self.opponent.flux or self.opponent.specialMeter or 0) - (self.player.flux or self.player.specialMeter or 0)
+
+    local pace = "normal"
+    if state_label == "time_pressure" or hp_delta < -20 then pace = "aggressive"
+    elseif hp_delta > 20 then pace = "slow" end
+
+    local win_condition = "resource_drain"
+    if hp_delta > 20 then win_condition = "time_out"
+    elseif state_label == "kill_range" then win_condition = "kill_confirm"
+    elseif meter_delta > 20 then win_condition = "resource_drain" end
+
+    local rt = self.config.risk_tolerance
+    if pace == "aggressive" then rt = clamp(rt + 0.15, 0.2, 0.9) end
+    if pace == "slow" then rt = clamp(rt - 0.12, 0.2, 0.9) end
+
+    self.strategic = {
+        pace = pace,
+        risk_tolerance = rt,
+        win_condition = win_condition,
+        last_update_frame = self.frame
+    }
+    self.logs.strategic[#self.logs.strategic + 1] = { frame = self.frame, pace = pace, risk_tolerance = rt, win_condition = win_condition }
+    return self.strategic
+end
+
+function AI:_selectPhasePolicy(state_label)
+    local phase_map = {
+        neutral = "neutral",
+        advantage = "advantage",
+        disadvantage = "disadvantage",
+        wakeup = "knockdown",
+        pressure = "knockdown",
+        scramble = "scramble",
+        kill_range = "kill_range",
+        time_pressure = "time_pressure"
+    }
+    local key = phase_map[state_label] or "neutral"
+    local pol = deepcopy((self.config.phase_policy and self.config.phase_policy[key]) or self.config.phase_policy.neutral)
+    pol.key = key
+    return pol
+end
+
+function AI:_volatilityScore(obs)
+    local d = math.abs((obs.ox or 0) - (obs.px or 0))
+    local stun = (obs.p_hitstun or 0) + (obs.o_hitstun or 0) + (obs.p_blockstun or 0) + (obs.o_blockstun or 0)
+    local hp_swing = math.abs((self.opponent.health or 0) - (self.player.health or 0))
+    local base = (d < 70 and 4 or 0) + stun * 0.25 + (hp_swing < 15 and 2 or 0)
+    return clamp(base, 0, 25)
+end
+
+function AI:_cacheKey(obs)
+    return string.format("%s|%d|%d|%d", self.state_classifier.last or "neutral", math.floor((obs.px or 0)/16), math.floor((obs.ox or 0)/16), math.floor(((obs.o_meter or 0))/10))
+end
+
+function AI:_recordSolvedCache(obs, action, score)
+    local key = self:_cacheKey(obs)
+    local c = self.solved_cache[key] or { visits = 0, score_sum = 0, action_hist = {} }
+    c.visits = c.visits + 1
+    c.score_sum = c.score_sum + (score or 0)
+    c.action_hist[action or "idle"] = (c.action_hist[action or "idle"] or 0) + 1
+    self.solved_cache[key] = c
+end
+
+function AI:_cachedInstinct(obs)
+    local key = self:_cacheKey(obs)
+    local c = self.solved_cache[key]
+    if not c or c.visits < self.config.self_improvement.solved_cache_min_visits then return nil end
+    local mean = c.score_sum / math.max(1, c.visits)
+    if math.abs(mean) > self.config.self_improvement.solved_cache_score_band then return nil end
+    local best, n = nil, -1
+    for a, k in pairs(c.action_hist) do if k > n then best, n = a, k end end
+    return best
+end
+
+function AI:enableLiveMetaLearning(cfg)
+    local c = cfg or {}
+    self.live_meta.enabled = true
+    self.live_meta.bracket_size = math.max(2, c.bracket_size or 64)
+    self.live_meta.scout_delay = math.max(60, c.scout_delay or 300)
+    self.live_meta.meta_update_interval = math.max(120, c.meta_update_interval or 900)
+    self.live_meta.last_update_frame = self.frame
+    return deepcopy(self.live_meta)
+end
+
+function AI:_updateLiveMetaLearning(obs)
+    local lm = self.live_meta
+    if not lm.enabled then return end
+    if self.frame < lm.scout_delay then return end
+
+    local w = self.human_policy.windows.actions or {}
+    local start_i = math.max(1, #w - 120)
+    local freq = {}
+    local total = 0
+    for i = start_i, #w do
+        local a = w[i]
+        if a then
+            freq[a] = (freq[a] or 0) + 1
+            total = total + 1
+        end
+    end
+    if total <= 0 then return end
+
+    for a, c in pairs(freq) do
+        lm.dominant_actions[a] = 0.9 * (lm.dominant_actions[a] or 0) + 0.1 * (c / total)
+    end
+
+    local dominant, share = "idle", 0
+    for a, p in pairs(lm.dominant_actions) do
+        if p > share then dominant, share = a, p end
+    end
+    lm.current_profile = dominant
+
+    local counter = { jump = "light", block = "throw", light = "block", heavy = "block", special = "walk_back", throw = "jump", walk_fwd = "light", walk_back = "walk_fwd", idle = "walk_fwd" }
+    lm.counter_bias = { dominant = dominant, share = share, recommended = counter[dominant] or "block" }
+    lm.observed_matches = lm.observed_matches + 1
+
+    if self.frame - (lm.last_update_frame or 0) >= lm.meta_update_interval then
+        lm.last_update_frame = self.frame
+        self.logs.live_meta[#self.logs.live_meta + 1] = {
+            frame = self.frame,
+            dominant = dominant,
+            share = share,
+            recommended = lm.counter_bias.recommended,
+            bracket_size = lm.bracket_size,
+            observed = lm.observed_matches
+        }
+    end
+end
+
+function AI:playTaunt(message)
+    local p = self.psych_warfare
+    if not p.enabled then return false end
+    if (p.taunt_cooldown or 0) > 0 then return false end
+    p.last_taunt = tostring(message or "")
+    p.taunt_cooldown = 300
+    p.taunt_count = (p.taunt_count or 0) + 1
+    self.logs.taunts[#self.logs.taunts + 1] = { frame = self.frame, message = p.last_taunt }
+    return true
+end
+
+function AI:predictTiltCascade(player_history)
+    local h = player_history or {}
+    local losses = h.loss_streak or 0
+    local shield = h.shield_streak or 0
+    local mash = h.mash_ratio or 0
+    local low_hp = h.low_hp and 1 or 0
+
+    local tilt = clamp(0.18 + 0.16 * losses + 0.08 * shield + 0.42 * mash + 0.16 * low_hp, 0, 0.98)
+    local predicted_mash = (tilt > 0.58) or mash > 0.45
+    local optimal_counter = predicted_mash and "block" or ((shield > 5) and "throw" or "light")
+    local confidence = clamp(0.45 + 0.45 * tilt, 0.2, 0.97)
+
+    return {
+        tilt_probability = tilt,
+        predicted_mash = predicted_mash,
+        optimal_counter = optimal_counter,
+        confidence = confidence
+    }
+end
+
+function AI:psychologicalTiltInducer(player_stats)
+    local ps = player_stats or {}
+    local p = self.psych_warfare
+    if not p.enabled then return nil end
+
+    local hint = nil
+    if (ps.shield_streak or 0) > 5 then
+        self:playTaunt("Predictable shielding detected")
+        hint = "throw"
+    elseif (ps.mash_ratio or 0) > 0.5 then
+        self:playTaunt("Mash pattern detected")
+        hint = "block"
+    elseif (ps.jump_ratio or 0) > 0.35 then
+        self:playTaunt("Jump escape pattern read")
+        hint = "light"
+    end
+
+    p.next_action_hint = hint
+    return hint
+end
+
+function AI:_humanPolicyStats()
+    local w = self.human_policy.windows.actions or {}
+    local n = math.min(#w, 80)
+    if n <= 0 then return { shield_streak = 0, mash_ratio = 0, jump_ratio = 0, loss_streak = 0, low_hp = false } end
+
+    local shield_streak, mash, jump = 0, 0, 0
+    local cur_shield = 0
+    for i = #w - n + 1, #w do
+        local a = w[i]
+        if a == "block" then
+            cur_shield = cur_shield + 1
+            shield_streak = math.max(shield_streak, cur_shield)
+        else
+            cur_shield = 0
+        end
+        if a == "light" and i > 1 and w[i-1] == "light" then mash = mash + 1 end
+        if a == "jump" then jump = jump + 1 end
+    end
+
+    local eval_n = math.min(30, #self.logs.eval_scores)
+    local losses = 0
+    for i = #self.logs.eval_scores - eval_n + 1, #self.logs.eval_scores do
+        if i >= 1 and (self.logs.eval_scores[i] or 0) < 0 then losses = losses + 1 end
+    end
+
+    local missed_parry = self.human_policy.tilt_patterns.missed_parry or 0
+    local perfect_shield = self.human_policy.tilt_patterns.perfect_shield or 0
+    self.human_policy.skill_ceiling = clamp(0.5 + 0.06 * perfect_shield - 0.05 * missed_parry, 0.1, 0.95)
+
+    return {
+        shield_streak = shield_streak,
+        mash_ratio = mash / n,
+        jump_ratio = jump / n,
+        loss_streak = losses,
+        low_hp = ((self.player.health or 100) <= 20),
+        skill_ceiling = self.human_policy.skill_ceiling
+    }
+end
+
+function AI:_conditionOpponentModel(obs)
+    local style = self.player_model.style
+    local respect = clamp((self.belief.perceived_threat or 0.5) + (style.panic_reversal or 0) * 0.25 - (style.backdash_frequency or 0) * 0.15, 0, 1)
+    self.belief.opponent_belief.expects_throw = clamp((self.belief.opponent_belief.expects_throw or 0.5) * 0.92 + (self.last_action == "throw" and 0.08 or -0.02), 0, 1)
+    self.belief.opponent_belief.expects_block = clamp((self.belief.opponent_belief.expects_block or 0.5) * 0.9 + ((self.last_action == "light" or self.last_action == "heavy") and 0.07 or -0.01), 0, 1)
+    self.cross_match_memory.adaptation_speed["global"] = 0.9 * (self.cross_match_memory.adaptation_speed["global"] or 0.5) + 0.1 * respect
+end
+
+function AI:_applyFeaturePruning()
+    if not self.feature_responsibility then return end
+    local pruned = {}
+    for k, st in pairs(self.feature_responsibility) do
+        if st.n and st.n >= 40 then
+            local signal = (st.impact or 0) / math.max(1e-6, (st.noise or 1))
+            if signal < 0.15 and self.config.eval_weights[k] ~= nil then
+                self.config.eval_weights[k] = self.config.eval_weights[k] * 0.9
+                pruned[#pruned + 1] = k
+            end
+        end
+    end
+    if #pruned > 0 then
+        self.logs.eval_mining[#self.logs.eval_mining + 1] = { frame = self.frame, type = "feature_prune", features = pruned }
+    end
+end
+
+function AI:_regressionCheckAndRollback()
+    local n = math.min(80, #self.logs.eval_scores)
+    if n < 20 then return end
+    local cur = 0
+    for i = #self.logs.eval_scores - n + 1, #self.logs.eval_scores do
+        cur = cur + (self.logs.eval_scores[i] or 0)
+    end
+    cur = cur / n
+
+    if not self.regression_guard.baseline then
+        self.regression_guard.baseline = cur
+        return
+    end
+
+    if (self.regression_guard.baseline - cur) > self.config.self_improvement.rollback_eval_drop and #self.eval_versions > 1 then
+        local prev = self.eval_versions[#self.eval_versions - 1]
+        self.config.eval_weights = deepcopy(prev.weights)
+        self.current_eval_version = prev.id
+        self.regression_guard.rollback_count = self.regression_guard.rollback_count + 1
+        self.logs.rollback[#self.logs.rollback + 1] = { frame = self.frame, to_version = prev.id, baseline = self.regression_guard.baseline, current = cur }
+    else
+        self.regression_guard.baseline = 0.9 * self.regression_guard.baseline + 0.1 * cur
+    end
+end
+
+function AI:_recordEvalVersion(note)
+    local id = #self.eval_versions + 1
+    self.eval_versions[#self.eval_versions + 1] = { id = id, weights = deepcopy(self.config.eval_weights), note = note or "auto" }
+    self.current_eval_version = id
+end
+
+function AI:_runStrategyTournament()
+    local contestants = { "baseline_fsm", "baseline_greedy_eval", "current" }
+    local score = { baseline_fsm = 0, baseline_greedy_eval = 0, current = 0 }
+    local obs = self:_observeState()
+    local root = self:_initSimState(obs)
+    local actions = {
+        baseline_fsm = AI.baseline_fsm(math.abs((obs.ox or 0) - (obs.px or 0))),
+        baseline_greedy_eval = AI.baseline_greedy_eval(self, obs),
+        current = self.last_action or "light"
+    }
+    for _, c in ipairs(contestants) do
+        local nxt = self:_applyActionOrMacro(root, actions[c], "idle", 6)
+        score[c] = self:evaluateState(nxt)
+    end
+    local winner, best = "current", -1e9
+    for k,v in pairs(score) do if v > best then winner, best = k, v end end
+    self.strategy_tournament.last_winner = winner
+    self.logs.tournaments[#self.logs.tournaments + 1] = { frame = self.frame, winner = winner, score = score }
+end
+
+function AI:_planAction(obs, layer_state)
+    if not self.config.ablations.search then
+        return "light", { score = 0, reason = "search_ablation", top = { "light" } }
+    end
+
+    self:_conditionOpponentModel(obs)
+    local volatility = self:_volatilityScore(obs)
+    local cached = self:_cachedInstinct(obs)
+    local epi_mode = self:_epistemicMode()
+    local degrade_mode = self:_gracefulDegradationMode(obs)
+
+    if self:_certaintyGate(obs) and volatility < self.config.self_improvement.volatility_trigger and cached then
+        return cached, { score = 0, reason = "certainty_gate_cached", top = { cached }, action_confidence = 0.92, volatility = volatility, epistemic_mode = epi_mode }
+    end
+
+    if degrade_mode == "fundamentals" then
+        return "block", { score = 0, reason = "graceful_degradation_fundamentals", top = { "block", "walk_back" }, action_confidence = 0.55, volatility = volatility, epistemic_mode = epi_mode }
+    elseif degrade_mode == "buy_time" then
+        return "walk_back", { score = 0, reason = "graceful_degradation_buy_time", top = { "walk_back", "block" }, action_confidence = 0.6, volatility = volatility, epistemic_mode = epi_mode }
+    end
+
+    local book = self:_openingBookAction(obs)
+    if book then return book, { score = 0, reason = "opening_book", top = { book } } end
+
+    local root = self:_initSimState(obs)
+    local counter_style = self:_synthesizeCounterStyle()
+    local layer = layer_state or {}
+
+    local old_depth, old_branch = self.config.max_rollout_depth, self.config.max_branching
+    local policy = layer.policy or { depth = old_depth, branching = old_branch, key = "neutral" }
+    self.config.max_rollout_depth = math.max(3, policy.depth or old_depth)
+    self.config.max_branching = math.max(3, policy.branching or old_branch)
+    self.active_phase_policy = policy
+
+    local strategic = layer.strategic or self.strategic
+    self.config.risk_tolerance = clamp((counter_style.risk_tolerance + (strategic.risk_tolerance or self.config.risk_tolerance)) * 0.5, 0.2, 0.9)
+
+    local budget = self:_timeBudgetMs(obs)
+    local branches, pred_meta = self:_predictOpponentBranches(obs)
+
+    local best_action, top, score
+    if self.config.mcts.enabled then
+        local ratio = self.meta_controller.selfplay_ratio or { mcts = 1, rl = 3 }
+        local ratio_boost = clamp((ratio.mcts or 1) / math.max(1, (ratio.rl or 3)), 0.25, 2.0)
+        local sims = math.max(64, math.floor(self.config.mcts.simulations * ratio_boost * (budget / math.max(self.config.decision_budget_ms, 0.1))))
+        best_action, top = self:mctsSearch(root, sims)
+        score = (top[1] and top[1].q or 0) * 100
+    else
+        local deadline = now_ms() + budget
+        local depth = math.max(2, self.config.max_rollout_depth)
+        local ordered_moves
+        score, best_action, ordered_moves = self:_iterativeDeepeningSearch(root, depth, deadline)
+        top = ordered_moves or { best_action or "idle" }
+    end
+
+    local pstats = self:_humanPolicyStats()
+    local cascade = self:predictTiltCascade(pstats)
+    local taunt_hint = self:psychologicalTiltInducer(pstats)
+    local live_meta_bias = self.live_meta.enabled and self.live_meta.counter_bias and self.live_meta.counter_bias.recommended or nil
+
+    if cascade.predicted_mash and cascade.confidence > 0.7 then
+        best_action = cascade.optimal_counter or best_action
+    end
+    if taunt_hint then best_action = taunt_hint end
+    if live_meta_bias and (self.frame % 90) < 18 then best_action = live_meta_bias end
+
+    if self:_isStrategyRetired(best_action) then
+        best_action = "block"
+    end
+
+    local kill_now = self:killConfirmPercent(obs.p_health or 0, 34, 1.22, 43, { x = obs.px or 0, y = obs.py or GAME_CONSTANTS.PLATFORM_Y })
+    if kill_now and (best_action == "light" or best_action == "walk_fwd") then
+        if (obs.o_meter or 0) >= GAME_CONSTANTS.SPECIAL_FLUX_COST then
+            best_action = "special"
+        else
+            best_action = "heavy"
+        end
+    end
+
+    local conf, worst, mean = self:_decisionConfidenceAndRisk(root, best_action or "idle", branches)
+    local risk_adjusted = (mean or 0) - math.sqrt(math.max(0, (mean or 0) - (worst or 0)))
+
+    -- long-horizon discomfort tolerance: when gathering info, allow temporary EV dip
+    if self.timescale.match_plan == "data_gathering" and pred_meta.confidence < 0.45 then
+        risk_adjusted = risk_adjusted + 2.0
+    end
+
+    self:_mineSearchDisagreement(root)
+
+    self.config.max_rollout_depth = old_depth
+    self.config.max_branching = old_branch
+    self.active_phase_policy = nil
+
+    return best_action or "idle", {
+        score = score or 0,
+        reason = self.config.mcts.enabled and "mcts" or "search",
+        prediction_confidence = pred_meta.confidence,
+        prediction_reason = pred_meta.reason,
+        branches = branches,
+        top = top,
+        budget_ms = budget,
+        counter_style = counter_style,
+        match_plan = self.timescale.match_plan,
+        action_confidence = conf,
+        action_worst_case = worst,
+        action_risk_adjusted = risk_adjusted,
+        state_class = layer.state_label or self.state_classifier.last,
+        phase_policy = policy.key,
+        strategic_pace = strategic.pace,
+        strategic_win_condition = strategic.win_condition,
+        volatility = volatility,
+        epistemic_mode = epi_mode,
+        tilt_cascade = cascade,
+        taunt_hint = taunt_hint,
+        live_meta = deepcopy(self.live_meta.counter_bias or {})
+    }
+end
+
+function AI:_threatMap(state)
+    local dist = math.abs((state.ox or 0) - (state.px or 0))
+    local f = self:extractFeatures(state)
+    return {
+        strike = clamp((80 - dist) / 80, 0, 1),
+        throw = clamp((45 - dist) / 45, 0, 1),
+        anti_air = f.anti_air_readiness or 0,
+        corner = ((state.px or 0) < 90) and 1 or 0
+    }
+end
+
+function AI:_counterfactuals(state)
+    local b = self:_rolloutState(self:_initSimState(state), "light", "block", 6)
+    local d = self:_rolloutState(self:_initSimState(state), "light", "walk_back", 6)
+    local s1 = self:evaluateState(b)
+    local s2 = self:evaluateState(d)
+    return { if_opponent_blocks = s1, if_opponent_disengages = s2, delta = s1 - s2 }
+end
+
+function AI:_applyMotorNoise(action)
+    local mode = self:_epistemicMode()
+    local noise = self.motor_noise + (self.fairness.execution_error or 0)
+    if mode == "uncertain" then noise = noise + 0.04 end
+    if mode == "certain" then noise = noise - 0.02 end
+    local profile = self.style_profile or "read-heavy"
+
+    if self.config.ablations.human_believability then
+        if profile == "patient" then noise = noise + 0.03 end
+        if profile == "aggressive" then noise = noise - 0.02 end
+        if self.timescale.match_plan == "data_gathering" and self.rng() < 0.12 then return "walk_back" end
+        if self.rng() < 0.08 then return "idle" end
+    end
+
+    if self.rng() < clamp(noise, 0, 0.35) then return "idle" end
+    return action
+end
+
+function AI:_execute(action)
+    if type(action) == "string" and action:match("^macro:") then
+        local name = action:gsub("^macro:", "")
+        local seq = self:_macroToPrimitive(name)
+        action = seq[1] or "idle"
+    end
+
+    self.opponent.ai_input = self.opponent.ai_input or {}
+    local inpt = self.opponent.ai_input
+    inpt.left, inpt.right, inpt.up, inpt.down, inpt.block = false, false, false, false, false
+    inpt.attack, inpt.special, inpt.throw = false, false, false
+
+    local dir = ((self.player.x or 0) > (self.opponent.x or 0)) and 1 or -1
+    self.opponent.facing = dir
+
+    if action == "walk_fwd" then
+        self.opponent.vx = (self.opponent.vx or 0) + GAME_CONSTANTS.WALK_ACCEL * dir
+        if dir > 0 then inpt.right = true else inpt.left = true end
+    elseif action == "walk_back" then
+        self.opponent.vx = (self.opponent.vx or 0) - GAME_CONSTANTS.WALK_ACCEL * dir
+        if dir > 0 then inpt.left = true else inpt.right = true end
+    elseif action == "block" then
+        inpt.block = true
+        self.opponent.shielding = true
+    elseif action == "jump" then
+        inpt.up = true
+        if (self.opponent.jumps or 0) > 0 then
+            self.opponent.vy = GAME_CONSTANTS.FULL_JUMP_VEL
+            self.opponent.on_ground = false
+            self.opponent.jumps = math.max(0, (self.opponent.jumps or 0) - 1)
+        end
+    elseif action == "light" then
+        inpt.attack = "light"
+        self.opponent.action = "light"
+        self.opponent.attack_cooldown = math.max(self.opponent.attack_cooldown or 0, 8)
+    elseif action == "heavy" then
+        inpt.attack = "heavy"
+        self.opponent.action = "heavy"
+        self.opponent.attack_cooldown = math.max(self.opponent.attack_cooldown or 0, 16)
+    elseif action == "special" then
+        if (self.opponent.flux or 0) >= GAME_CONSTANTS.SPECIAL_FLUX_COST then
+            inpt.special = true
+            self.opponent.action = "special"
+            self.opponent.flux = clamp((self.opponent.flux or 0) - GAME_CONSTANTS.SPECIAL_FLUX_COST, 0, GAME_CONSTANTS.FLUX_CAP)
+            self.opponent.attack_cooldown = math.max(self.opponent.attack_cooldown or 0, 20)
+        end
+    elseif action == "throw" then
+        inpt.throw = true
+        self.opponent.action = "throw"
+        self.opponent.attack_cooldown = math.max(self.opponent.attack_cooldown or 0, 18)
+    end
+end
+
+
+function AI:_certaintyGate(obs)
+    local idx = #self.logs.search_stats
+    local prev = self.logs.search_stats[idx] or {}
+    local certainty = clamp((self.belief.accuracy or 0.5) * (1 - (obs.uncertainty or 0)) + (prev.action_confidence or 0) * 0.35, 0, 1)
+    local stable = math.abs(prev.action_risk_adjusted or 0) < 6 and (prev.counter_style ~= nil)
+    return certainty > 0.78 and stable
+end
+
+function AI:_autoDiscoverWeaknesses()
+    local eval_drop, pred_fail, regret_spike = 0, 0, 0
+    local start_i = math.max(2, #self.logs.eval_scores - 120)
+    for i = start_i, #self.logs.eval_scores do
+        local d = (self.logs.eval_scores[i] or 0) - (self.logs.eval_scores[i - 1] or 0)
+        if d < -8 then eval_drop = eval_drop + 1 end
+        local p = self.logs.prediction[i] or {}
+        if (p.confidence or 0) > 0.65 and (self.logs.eval_scores[i] or 0) < -3 then pred_fail = pred_fail + 1 end
+    end
+    for i = math.max(1, #self.logs.regret - 120), #self.logs.regret do
+        if (self.logs.regret[i] and self.logs.regret[i].regret or 0) > 8 then regret_spike = regret_spike + 1 end
+    end
+    self.weakness_focus = { eval_drop = eval_drop, pred_fail = pred_fail, regret_spike = regret_spike }
+    if eval_drop + pred_fail + regret_spike >= 4 then
+        self.config.max_rollout_depth = math.min(14, self.config.max_rollout_depth + 1)
+        self.config.eval_weights.risk_exposure = self.config.eval_weights.risk_exposure - 0.02
+    end
+end
+
+function AI:_painWeightedUpdate(reward)
+    self.cross_match_memory.pain_memory = self.cross_match_memory.pain_memory or 0
+    if reward < 0 then
+        self.cross_match_memory.pain_memory = clamp(self.cross_match_memory.pain_memory + math.abs(reward) * 0.35, 0, 20)
+    else
+        self.cross_match_memory.pain_memory = clamp(self.cross_match_memory.pain_memory - reward * 0.08, 0, 20)
+    end
+    self.config.risk_tolerance = clamp(self.config.risk_tolerance - self.cross_match_memory.pain_memory * 0.002, 0.2, 0.8)
+end
+
+function AI:_updateOpponentIdentity(player_id)
+    local id = player_id or "default"
+    local fp = self.cross_match_memory.opponent_fingerprints[id] or { matches = 0, aggression = 0.5, adaptation_speed = 0.5, panic = 0.5 }
+    fp.matches = fp.matches + 1
+    fp.aggression = 0.85 * fp.aggression + 0.15 * (self.player_model.style.aggression or 0.5)
+    fp.adaptation_speed = 0.85 * fp.adaptation_speed + 0.15 * (self.cross_match_memory.adaptation_speed["light"] or 0.5)
+    fp.panic = 0.85 * fp.panic + 0.15 * (self.player_model.style.panic_reversal or 0.5)
+    self.cross_match_memory.opponent_fingerprints[id] = fp
+end
+
+function AI:_detectStrategicBoredom()
+    local start_i = math.max(1, #self.logs.decisions - 80)
+    local freq, outcome_var = {}, 0
+    for i = start_i, #self.logs.decisions do
+        local a = self.logs.decisions[i]
+        freq[a] = (freq[a] or 0) + 1
+        outcome_var = outcome_var + math.abs(self.logs.eval_scores[i] or 0)
+    end
+    local max_share = 0
+    local total = math.max(1, #self.logs.decisions - start_i + 1)
+    for _, c in pairs(freq) do max_share = math.max(max_share, c / total) end
+    if max_share > 0.72 and outcome_var / total < 6 then
+        self.timescale.match_plan = "data_gathering"
+        self.config.risk_tolerance = clamp(self.config.risk_tolerance + 0.05, 0.2, 0.85)
+    end
+end
+
+function AI:_trackFeatureResponsibility(features, score)
+    self.feature_responsibility = self.feature_responsibility or {}
+    for k, v in pairs(features) do
+        if type(v) == "number" then
+            local st = self.feature_responsibility[k] or { impact = 0, noise = 0, n = 0 }
+            st.n = st.n + 1
+            st.impact = 0.9 * st.impact + 0.1 * math.abs(v * (score or 0))
+            st.noise = 0.9 * st.noise + 0.1 * math.abs(v)
+            self.feature_responsibility[k] = st
+        end
+    end
+end
+
+function AI:_learningUpdate(reward_signal)
+    if not self.learning.enabled then return end
+    local delta = reward_signal * self.learning.step_size
+    self.learning.value_bias = clamp(self.learning.value_bias + delta, -5, 5)
+    self.learning.updates = self.learning.updates + 1
+    self.logs.learning_updates[#self.logs.learning_updates + 1] = { frame = self.frame, delta = delta, value_bias = self.learning.value_bias }
+end
+
+
+function AI:_epistemicSelfCritique(obs, action, meta)
+    local believed_good = (meta.action_confidence or 0.5) * (meta.score or 0)
+    local root = self:_initSimState(obs)
+    local alt = self:_applyActionOrMacro(root, "block", "idle", 6)
+    local alt_score = self:evaluateState(alt)
+    local chosen_next = self:_applyActionOrMacro(root, action, "idle", 6)
+    local chosen_score = self:evaluateState(chosen_next)
+
+    local belief_error = alt_score - chosen_score
+    if belief_error > 0 then
+        -- punish confidence calibration, not move primitive itself
+        self.belief.confidence = clamp(self.belief.confidence - 0.02 * clamp(belief_error / 20, 0, 1), 0.1, 0.95)
+        self.belief.overconfidence = clamp(self.belief.overconfidence + 0.03, 0, 1)
+    else
+        self.belief.confidence = clamp(self.belief.confidence + 0.005, 0.1, 0.95)
+        self.belief.overconfidence = clamp(self.belief.overconfidence - 0.01, 0, 1)
+    end
+
+    self.logs.epistemic[#self.logs.epistemic + 1] = {
+        frame = self.frame,
+        believed_score = believed_good,
+        chosen_score = chosen_score,
+        best_baseline_score = alt_score,
+        belief_error = belief_error,
+        confidence = self.belief.confidence,
+        overconfidence = self.belief.overconfidence
+    }
+
+    self:_updateStrategyRegret(action, chosen_score, alt_score, self:_currentPhase(obs))
+end
+
+function AI:_selfCritique()
+    local failures, luck, exploitable = 0, 0, 0
+    local start_i = math.max(1, #self.logs.decisions - 60)
+    for i = start_i, #self.logs.decisions do
+        local pred = self.logs.prediction[i] or {}
+        local conf = pred.confidence or 0
+        local score = self.logs.eval_scores[i] or 0
+        if conf > 0.75 and score < 0 then failures = failures + 1 end
+        if conf < 0.3 and score > 0 then luck = luck + 1 end
+        if self.logs.decisions[i] == "heavy" and conf < 0.4 then exploitable = exploitable + 1 end
+    end
+
+    self.belief.confidence = clamp(self.belief.confidence - failures * 0.01 - luck * 0.005, 0.1, 0.95)
+    self.config.risk_tolerance = clamp(self.config.risk_tolerance - exploitable * 0.01, 0.2, 0.8)
+
+    local fp = {
+        tilt = self.player_model.style.tilt_level,
+        panic_reversal = self.player_model.style.panic_reversal,
+        mash_spike = self.player_model.style.mash_spike,
+        bait_timing = self.player_model.conditioning_memory.personalized_bait_timing
+    }
+    self.cross_match_memory.opponent_fingerprints["default"] = fp
+
+    self.logs.self_critique[#self.logs.self_critique + 1] = {
+        frame = self.frame,
+        failed_reads = failures,
+        lucky_successes = luck,
+        exploitable_patterns = exploitable,
+        updated_confidence = self.belief.confidence,
+        updated_risk_tolerance = self.config.risk_tolerance
+    }
+end
+
+function AI:_logDecision(obs, action, meta)
+    local score, features = self:evaluateState(obs)
+    local breakdown = self:dumpEvalBreakdown(obs)
+    self.last_breakdown = deepcopy(breakdown)
+    self:_trackFeatureResponsibility(features, score)
+    self:_recordSolvedCache(obs, action, score)
+
+    self.logs.trajectories[#self.logs.trajectories + 1] = deepcopy(obs)
+    self.logs.decisions[#self.logs.decisions + 1] = action
+    self.logs.eval_scores[#self.logs.eval_scores + 1] = score
+    self.logs.eval_breakdown[#self.logs.eval_breakdown + 1] = breakdown
+    self.logs.top_actions[#self.logs.top_actions + 1] = deepcopy(meta.top or { action })
+    self.logs.prediction[#self.logs.prediction + 1] = {
+        confidence = meta.prediction_confidence or 0,
+        reason = meta.prediction_reason or "n/a",
+        branches = deepcopy(meta.branches or {})
+    }
+
+    self.logs.belief[#self.logs.belief + 1] = deepcopy(self.belief)
+    self.logs.uncertainty[#self.logs.uncertainty + 1] = {
+        observation_noise = self.config.observation_noise,
+        reaction_delay_frames = self.config.reaction_delay_frames,
+        match_plan = self.timescale.match_plan
+    }
+    self.logs.novelty[#self.logs.novelty + 1] = { novelty_buffer_size = (self.novelty_memory and #self.novelty_memory) or 0, plan = self.timescale.match_plan }
+    self.logs.info_value[#self.logs.info_value + 1] = {
+        expected_info = features.info_gain or 0,
+        deception_value = features.deception_value or 0,
+        confidence_heat = clamp(1 - (features.uncertainty or 0), 0, 1)
+    }
+
+    local threat_map = self:_threatMap(obs)
+    local counterfactual = self:_counterfactuals(obs)
+    local terms = self:_dominantEvalTerms(breakdown)
+    local top_terms = { terms[1], terms[2], terms[3] }
+    self.logs.search_stats[#self.logs.search_stats + 1] = {
+        budget_ms = meta.budget_ms or 0,
+        reason = meta.reason or "n/a",
+        counter_style = meta.counter_style and meta.counter_style.name or "n/a",
+        why = string.format("phase=%s risk=%.2f info=%.2f", features.phase or "neutral", features.risk_exposure or 0, features.info_gain or 0),
+        threat_map = threat_map,
+        counterfactual = counterfactual,
+        dominant_terms = top_terms,
+        flip_candidates = self:_flipCandidates(features),
+        action_confidence = meta.action_confidence or 0,
+        action_worst_case = meta.action_worst_case or 0,
+        action_risk_adjusted = meta.action_risk_adjusted or 0,
+        volatility = meta.volatility or 0,
+        epistemic_mode = meta.epistemic_mode or self:_epistemicMode()
+    }
+
+    self.logs.degradation[#self.logs.degradation + 1] = {
+        frame = self.frame,
+        mode = meta.epistemic_mode or self:_epistemicMode(),
+        reason = meta.reason or "search",
+        confidence = self.belief.confidence,
+        uncertainty = self.belief.uncertainty
+    }
+
+    self.logs.training_samples[#self.logs.training_samples + 1] = {
+        frame = self.frame,
+        state = deepcopy(obs),
+        chosen_action = action,
+        search_score = meta.score or 0
+    }
+end
+
+function AI:update(dt, observed_player_action)
+    self.frame = self.frame + 1
+
+    local obs = self:_observeState()
+    self:_updatePlayerModel(obs, observed_player_action)
+    self:_updateHumanPolicyModel(obs, observed_player_action)
+    self:_reactionQueuePush(observed_player_action or "unknown")
+    self:_updateBeliefState(obs, observed_player_action)
+    self:_updateTimescalePlan(obs)
+    self:_updateLiveMetaLearning(obs)
+    if (self.psych_warfare.taunt_cooldown or 0) > 0 then
+        self.psych_warfare.taunt_cooldown = self.psych_warfare.taunt_cooldown - 1
+    end
+
+    local state_label, state_conf = self:_classifyState(obs)
+    local strategic = self:_updateStrategicLayer(obs, state_label)
+    local policy = self:_selectPhasePolicy(state_label)
+
+    local action, meta = self:_planAction(obs, { state_label = state_label, strategic = strategic, policy = policy })
+    action = self:_applyMotorNoise(action)
+    self:_execute(action)
+    self.last_action = action
+
+    self:_shapeOpponent(meta)
+
+    local opp_guess = (meta.branches and meta.branches[1] and meta.branches[1].action) or "idle"
+    local sim_root = self:_initSimState(obs)
+    local next_obs = self:_applyActionOrMacro(sim_root, action, opp_guess, 6)
+    local reward = clamp(((next_obs.o_health or 0) - (next_obs.p_health or 0)) * 0.01, -1, 1)
+    local policy_target = {}
+    if type(meta.top) == "table" and #meta.top > 0 and type(meta.top[1]) == "table" then
+        local sum = 0
+        for _, row in ipairs(meta.top) do
+            local a = row.action
+            local v = tonumber(row.visits or row.p or 0) or 0
+            if a then
+                policy_target[a] = (policy_target[a] or 0) + math.max(0, v)
+                sum = sum + math.max(0, v)
+            end
+        end
+        if sum > 0 then
+            for _, a in ipairs(ACTIONS) do policy_target[a] = (policy_target[a] or 0) / sum end
+        end
+    end
+    self:_storeMuZeroTransition(obs, action, opp_guess, next_obs, reward, policy_target)
+    self:_learningUpdate(reward)
+    self:_painWeightedUpdate(reward)
+    self:_epistemicSelfCritique(obs, action, meta)
+
+    local prev_eval = self.logs.eval_scores[#self.logs.eval_scores] or 0
+    self:_recordCausalEvent("decision", { action = action, reason = meta.reason, delta_eval = (meta.score or 0) - prev_eval, phase = state_label })
+
+    if reward < 0 then
+        self:_counterfactualResponsibility(obs, action)
+        self:_causalPostmortem()
+    end
+    if self.frame % 120 == 0 then
+        self:trainMuZeroFromReplay({ epochs = 1, batch_size = 96 })
+        self:_selfCritique()
+        self:_autoDiscoverWeaknesses()
+        self:_detectStrategicBoredom()
+        self:_updateOpponentIdentity("default")
+        self:_applyFeaturePruning()
+        self:_regressionCheckAndRollback()
+        self:_runStrategyTournament()
+    end
+    self.logs.layered[#self.logs.layered + 1] = {
+        frame = self.frame,
+        state_class = state_label,
+        classifier_confidence = state_conf,
+        strategic_pace = strategic.pace,
+        strategic_win_condition = strategic.win_condition,
+        policy = policy.key,
+        planned_action = action
+    }
+    self:_logDecision(obs, action, meta)
+end
+
+
+function AI:updateCurriculum()
+    local g = self.league.games_played
+    if g > 200 then self.meta_controller.curriculum_stage = 3
+    elseif g > 50 then self.meta_controller.curriculum_stage = 2
+    else self.meta_controller.curriculum_stage = 1 end
+end
+
+function AI:recordLeagueSnapshot(name, elo)
+    local id = name or ("snapshot_" .. tostring(#self.league.snapshots + 1))
+    self.league.snapshots[#self.league.snapshots + 1] = id
+    self.league.elo[id] = elo or 1500
+end
+
+function AI:_personaRewardShape(base_reward, persona)
+    if persona == "aggressive" then return base_reward + 0.1 end
+    if persona == "defensive" then return base_reward - 0.05 end
+    return base_reward
+end
+
+function AI:_pfspWeight(winrate)
+    local t = self.meta_controller.pfsp_temperature or 1.0
+    local w = math.pow(clamp(1 - (winrate or 0.5), 0.05, 0.95), 1 / math.max(0.25, t))
+    return w
+end
+
+function AI:_leagueWinrate(id)
+    local wr = self.league.winrate[id]
+    if wr ~= nil then return wr end
+    local s = self.meta_controller.opponent_bandit[id] or { n = 1, reward = 0 }
+    local mean = s.reward / math.max(1, s.n)
+    return clamp(0.5 + mean * 0.1, 0.05, 0.95)
+end
+
+function AI:runSelfPlayLeague(total_games, opts)
+    local cfg = opts or {}
+    local games = math.max(1, total_games or 10000)
+    if #self.league.snapshots == 0 then
+        self:recordLeagueSnapshot("baseline_fsm", 1300)
+        self:recordLeagueSnapshot("aggressive_bot", 1450)
+        self:recordLeagueSnapshot("defensive_bot", 1450)
+        self.league.personas["baseline_fsm"] = "balanced"
+        self.league.personas["aggressive_bot"] = "aggressive"
+        self.league.personas["defensive_bot"] = "defensive"
+    end
+
+    local rng = make_rng(self.config.seed + self.league.games_played)
+    local report = { games = games, wins = 0, losses = 0, draws = 0, opponents = {} }
+    for _ = 1, games do
+        local opp = self:selectLeagueOpponent()
+        if not opp then opp = self.league.snapshots[math.floor(rng() * #self.league.snapshots) + 1] end
+        local persona = self.league.personas[opp] or "balanced"
+
+        local obs = self:_observeState()
+        local root = self:_initSimState(obs)
+        local act_self = self.last_action or "light"
+        local act_opp = (persona == "aggressive") and "heavy" or ((persona == "defensive") and "block" or "light")
+        local end_state = self:_rolloutState(root, act_self, act_opp, cfg.frames or 10)
+
+        local reward = ((end_state.o_health or 0) - (end_state.p_health or 0)) / 100
+        reward = self:_personaRewardShape(reward, persona)
+        self:recordLeagueResult(opp, reward)
+
+        report.opponents[opp] = (report.opponents[opp] or 0) + 1
+        if reward > 0.02 then report.wins = report.wins + 1
+        elseif reward < -0.02 then report.losses = report.losses + 1
+        else report.draws = report.draws + 1 end
+
+        self.league.helt[persona] = (self.league.helt[persona] or 0) + 1
+    end
+
+    local n = math.max(1, report.wins + report.losses + report.draws)
+    report.win_rate = report.wins / n
+    report.loss_rate = report.losses / n
+    report.draw_rate = report.draws / n
+    self.logs.tournaments[#self.logs.tournaments + 1] = { frame = self.frame, type = "pfsp_self_play", report = deepcopy(report) }
+    return report
+end
+
+function AI:selectLeagueOpponent()
+    if #self.league.snapshots == 0 then return nil end
+
+    local weights = {}
+    local total_w = 0
+    for _, id in ipairs(self.league.snapshots) do
+        local wr = self:_leagueWinrate(id)
+        local w = self:_pfspWeight(wr)
+        local adapt = self.cross_match_memory.adaptation_speed[id] or 0.5
+        local pop = self.cross_match_memory.strategy_popularity[id] or 0
+        w = w * (1 + 0.2 * (1 - adapt)) * (1 / (1 + 0.01 * pop))
+        weights[#weights + 1] = { id = id, w = w }
+        total_w = total_w + w
+    end
+
+    local r = self.rng() * math.max(total_w, 1e-6)
+    local acc = 0
+    for _, it in ipairs(weights) do
+        acc = acc + it.w
+        if r <= acc then return it.id end
+    end
+    return weights[#weights].id
+end
+
+function AI:recordLeagueResult(opponent_id, reward)
+    self.league.games_played = self.league.games_played + 1
+    local s = self.meta_controller.opponent_bandit[opponent_id] or { n = 0, reward = 0 }
+    s.n = s.n + 1
+    s.reward = s.reward + (reward or 0)
+    self.meta_controller.opponent_bandit[opponent_id] = s
+
+    local wr_prev = self.league.winrate[opponent_id] or 0.5
+    local outcome = ((reward or 0) > 0.02) and 1 or (((reward or 0) < -0.02) and 0 or 0.5)
+    local wr = 0.95 * wr_prev + 0.05 * outcome
+    self.league.winrate[opponent_id] = wr
+
+    local self_elo = self.league.elo["current"] or 1500
+    local opp_elo = self.league.elo[opponent_id] or 1500
+    local exp = 1 / (1 + math.pow(10, (opp_elo - self_elo) / 400))
+    local k = 12
+    self_elo = self_elo + k * (outcome - exp)
+    opp_elo = opp_elo + k * ((1 - outcome) - (1 - exp))
+    self.league.elo["current"] = self_elo
+    self.league.elo[opponent_id] = opp_elo
+
+    self:updateCurriculum()
+end
+
+function AI:getFormalDefinition()
+    return {
+        state_space = {
+            "position(x,y)", "velocity(y)", "facing", "health", "meter", "frame_state", "hitstun", "blockstun", "current_move", "airborne"
+        },
+        action_space = ACTIONS,
+        observation_model = { full_information = false, reaction_delay_frames = self.config.reaction_delay_frames, observation_noise = self.config.observation_noise },
+        reward = { dense = true, sparse_round_win = true, multi_objective = true },
+        episode_termination = { "timeout", "player_ko", "opponent_ko" }
+    }
+end
+
+function AI:getFrameData(move)
+    return deepcopy(FRAME_DATA[move])
+end
+
+function AI:setDifficulty(level)
+    local d = clamp(level or 0.5, 0, 1)
+    self.config.difficulty = d
+    self.config.reaction_delay_frames = math.floor(4 + (1 - d) * 12)
+    self.config.max_rollout_depth = math.floor(3 + d * 9)
+    self.config.max_branching = math.floor(2 + d * 7)
+    self.config.decision_budget_ms = 1.5 + d * 5.0
+    self.motor_noise = (1 - d) * 0.12
+    self.fairness.reaction_time_limit_frames = math.floor(4 + (1 - d) * 12 * self.config.fairness_sliders.reaction_limit)
+    self.fairness.execution_error = clamp(self.config.fairness_sliders.execution_error + (1 - d) * 0.04, 0, 0.25)
+end
+
+function AI:setFairnessSliders(sliders)
+    if not sliders then return end
+    for k, v in pairs(sliders) do
+        if self.config.fairness_sliders[k] ~= nil then self.config.fairness_sliders[k] = clamp(v, 0, 1) end
+    end
+    self.fairness.reaction_time_limit_frames = math.floor(4 + (self.config.reaction_delay_frames - 4) * self.config.fairness_sliders.reaction_limit)
+    self.fairness.execution_error = self.config.fairness_sliders.execution_error
+    self.fairness.input_buffer_leniency = self.config.fairness_sliders.input_buffer_leniency
+end
+
+function AI:ingestDatasetPriors(samples)
+    if type(samples) ~= "table" then return end
+    for _, row in ipairs(samples) do
+        local bucket = row.situation or "scramble"
+        self.dataset_priors.situations[bucket] = self.dataset_priors.situations[bucket] or {}
+        table.insert(self.dataset_priors.situations[bucket], row)
+        local a = row.action or "unknown"
+        self.dataset_priors.action_frequencies[a] = (self.dataset_priors.action_frequencies[a] or 0) + 1
+        if row.timing then
+            self.dataset_priors.timing_distributions[bucket] = self.dataset_priors.timing_distributions[bucket] or {}
+            table.insert(self.dataset_priors.timing_distributions[bucket], row.timing)
+        end
+        if row.risk_threshold then self.dataset_priors.risk_thresholds[bucket] = row.risk_threshold end
+    end
+end
+
+function AI:setStyleProfile(name)
+    self.style_profile = name or "read-heavy"
+end
+
+function AI:runOfflineMetaTuning(samples)
+    local n = math.max(8, samples or #self.logs.training_samples)
+    local eps = 0.03
+    local keys = { "threat_count", "risk_exposure", "frame_advantage", "corner_pressure" }
+    local base = 0
+    for i = math.max(1, #self.logs.eval_scores - n + 1), #self.logs.eval_scores do
+        base = base + (self.logs.eval_scores[i] or 0)
+    end
+    base = base / n
+
+    local grad = {}
+    for _, k in ipairs(keys) do
+        local w = self.config.eval_weights[k] or 0
+        local plus = w + eps
+        local minus = w - eps
+        local signal = 0
+        for i = math.max(1, #self.logs.eval_breakdown - n + 1), #self.logs.eval_breakdown do
+            local b = self.logs.eval_breakdown[i] or {}
+            signal = signal + ((b[k] or 0) * (plus - minus))
+        end
+        grad[k] = signal / (n * 2 * eps)
+    end
+
+    local lr = 0.01
+    local before = deepcopy(self.config.eval_weights)
+    for _, k in ipairs(keys) do
+        self.config.eval_weights[k] = (self.config.eval_weights[k] or 0) + lr * grad[k]
+    end
+
+    self:_recordEvalVersion("offline_tuning")
+    self.logs.eval_mining[#self.logs.eval_mining + 1] = { frame = self.frame, type = "offline_tuning", before = before, after = deepcopy(self.config.eval_weights) }
+
+    return {
+        sample_count = n,
+        base_score = base,
+        gradient = grad,
+        updated_weights = deepcopy(self.config.eval_weights)
+    }
+end
+
+function AI:registerBenchmarkScenario(name, cfg)
+    if not name then return end
+    local scenario = deepcopy(cfg or {})
+    scenario.name = name
+    scenario.frames = scenario.frames or 180
+    scenario.matches = scenario.matches or 20
+    scenario.seed = scenario.seed or self.config.seed
+    self.benchmarks.scenarios[name] = scenario
+end
+
+function AI:_simulatePolicyDuel(obs, policy_a, policy_b, frames)
+    local state = self:_initSimState(obs)
+    local rng = make_rng((obs.seed or self.config.seed) + frames)
+    for _ = 1, frames do
+        local a = policy_a(self, state, rng) or "idle"
+        local b = policy_b(self, state, rng) or "idle"
+        state = self:_rolloutState(state, a, b, 1)
+        if state.o_health <= 0 or state.p_health <= 0 then break end
+    end
+    return state
+end
+
+function AI:runBenchmarkSuite(request)
+    local req = request or {}
+    local report = { scenarios = {}, summary = { total = 0, wins = 0, losses = 0, draws = 0 } }
+
+    if next(self.benchmarks.scenarios) == nil then
+        self:registerBenchmarkScenario("default_neutral", { frames = 220, matches = 24 })
+        self:registerBenchmarkScenario("default_scramble", { frames = 140, matches = 24 })
+    end
+
+    for name, sc in pairs(self.benchmarks.scenarios) do
+        local wins, losses, draws = 0, 0, 0
+        for m = 1, (req.matches or sc.matches) do
+            local obs = self:_observeState()
+            obs.seed = sc.seed + m
+            local baseline = function(ai, st, rng)
+                local dist = math.abs((st.ox or 0) - (st.px or 0))
+                if name:find("scramble") then
+                    return (rng() < 0.4) and "block" or AI.baseline_greedy_eval(ai, st)
+                end
+                return AI.baseline_fsm(dist)
+            end
+            local current = function(ai, st, _)
+                local a, _meta = ai:_planAction(st, { state_label = ai:_currentPhase(st), strategic = ai.strategic, policy = ai:_selectPhasePolicy(ai:_currentPhase(st)) })
+                return a
+            end
+
+            local end_state = self:_simulatePolicyDuel(obs, current, baseline, req.frames or sc.frames)
+            if (end_state.o_health or 0) > (end_state.p_health or 0) then wins = wins + 1
+            elseif (end_state.o_health or 0) < (end_state.p_health or 0) then losses = losses + 1
+            else draws = draws + 1 end
+        end
+
+        local n = math.max(1, wins + losses + draws)
+        local row = {
+            scenario = name,
+            matches = n,
+            win_rate = wins / n,
+            loss_rate = losses / n,
+            draw_rate = draws / n,
+            elo_delta_est = ((wins - losses) / n) * 300
+        }
+        report.scenarios[#report.scenarios + 1] = row
+        report.summary.total = report.summary.total + n
+        report.summary.wins = report.summary.wins + wins
+        report.summary.losses = report.summary.losses + losses
+        report.summary.draws = report.summary.draws + draws
+        self.benchmarks.results[name] = row
+    end
+
+    local total = math.max(1, report.summary.total)
+    report.summary.win_rate = report.summary.wins / total
+    report.summary.loss_rate = report.summary.losses / total
+    report.summary.draw_rate = report.summary.draws / total
+
+    self.benchmarks.total_matches = self.benchmarks.total_matches + report.summary.total
+    self.logs.benchmarks[#self.logs.benchmarks + 1] = deepcopy(report)
+    return report
+end
+
+function AI:trainPolicyFromSelfPlay(opts)
+    local cfg = opts or {}
+    local epochs = cfg.epochs or 3
+    local lr = cfg.lr or 0.001
+    local max_samples = cfg.samples or 512
+
+    if not self.nn then
+        self.nn = { value_w = {}, policy_w = {} }
+        for i = 1, 10 do self.nn.value_w[i] = 0 end
+        for _, a in ipairs(ACTIONS) do self.nn.policy_w[a] = 0 end
+    end
+
+    local samples = {}
+    local start_i = math.max(1, #self.logs.training_samples - max_samples + 1)
+    for i = start_i, #self.logs.training_samples do
+        samples[#samples + 1] = self.logs.training_samples[i]
+    end
+    if #samples == 0 then return { epochs = 0, samples = 0, loss = 0 } end
+
+    local total_loss = 0
+    self.rl.enabled = true
+    for _ = 1, epochs do
+        for _, smp in ipairs(samples) do
+            local score, feats = self:evaluateState(smp.state)
+            local target = math.tanh((smp.search_score or 0) / 100)
+            local pred = 0
+            local x = {
+                feats.health_diff or 0, feats.frame_advantage or 0, feats.corner_pressure or 0,
+                feats.resource_availability or 0, feats.threat_count or 0, feats.risk_exposure or 0,
+                feats.uncertainty or 0, feats.neutral_control or 0, feats.throw_threat or 0,
+                feats.anti_air_readiness or 0
+            }
+            for i = 1, #x do pred = pred + (self.nn.value_w[i] or 0) * x[i] end
+            pred = math.tanh(pred)
+            local err = (target - pred)
+            total_loss = total_loss + err * err
+            for i = 1, #x do
+                self.nn.value_w[i] = (self.nn.value_w[i] or 0) + lr * err * x[i]
+            end
+
+            local a = smp.chosen_action or "idle"
+            self.nn.policy_w[a] = (self.nn.policy_w[a] or 0) + lr * (target - score / 100)
+        end
+    end
+
+    self.config.hybrid.critic_enabled = true
+    self.rl.steps = self.rl.steps + #samples * epochs
+    self.rl.epochs = self.rl.epochs + epochs
+    self.rl.last_loss = total_loss / math.max(1, #samples * epochs)
+    self.logs.rl[#self.logs.rl + 1] = { frame = self.frame, epochs = epochs, samples = #samples, loss = self.rl.last_loss }
+
+    return { epochs = epochs, samples = #samples, loss = self.rl.last_loss, critic_enabled = self.config.hybrid.critic_enabled }
+end
+
+function AI:exportReproducibilityManifest()
+    return {
+        commit_eval_version = self.current_eval_version,
+        seed = self.config.seed,
+        config = self:experimentConfig(),
+        benchmarks = deepcopy(self.benchmarks.results),
+        rl = deepcopy(self.rl),
+        dataset_sizes = {
+            training_samples = #self.logs.training_samples,
+            eval_scores = #self.logs.eval_scores,
+            disagreements = #self.logs.disagreement
+        }
+    }
+end
+
+function AI:buildHyperparamSweep(grid)
+    local g = grid or {}
+    local depths = g.depths or { 6, 8, 10 }
+    local sims = g.sims or { 128, 256, 512 }
+    local risks = g.risks or { 0.35, 0.5, 0.65 }
+    local seeds = g.seeds or { self.config.seed, self.config.seed + 1 }
+    local out = {}
+    for _, d in ipairs(depths) do
+        for _, s in ipairs(sims) do
+            for _, r in ipairs(risks) do
+                for _, seed in ipairs(seeds) do
+                    out[#out + 1] = {
+                        max_rollout_depth = d,
+                        mcts_simulations = s,
+                        risk_tolerance = r,
+                        seed = seed
+                    }
+                end
+            end
+        end
+    end
+    return out
+end
+
+function AI:loadCriticWeights(weights)
+    -- weights = { value_w = { ... } }
+    if type(weights) == "table" then self.nn = deepcopy(weights) end
+end
+
+function AI:getLogs() return deepcopy(self.logs) end
+
+function AI:annotatedDecisionAt(index)
+    return {
+        frame = index,
+        action = self.logs.decisions[index],
+        top_actions = self.logs.top_actions[index],
+        eval_score = self.logs.eval_scores[index],
+        eval_breakdown = self.logs.eval_breakdown[index],
+        prediction = self.logs.prediction[index],
+        belief = self.logs.belief[index],
+        uncertainty = self.logs.uncertainty[index],
+        info_value = self.logs.info_value[index],
+        search = self.logs.search_stats[index]
+    }
+end
+
+function AI:experimentConfig()
+    return {
+        seed = self.config.seed,
+        fixed_dt = self.config.fixed_dt,
+        max_rollout_depth = self.config.max_rollout_depth,
+        max_branching = self.config.max_branching,
+        decision_budget_ms = self.config.decision_budget_ms,
+        quiescence_depth = self.config.quiescence_depth,
+        difficulty = self.config.difficulty,
+        eval_weights = deepcopy(self.config.eval_weights),
+        phase_weights = deepcopy(self.config.phase_weights),
+        fairness_sliders = deepcopy(self.config.fairness_sliders),
+        hybrid = deepcopy(self.config.hybrid),
+        mcts = deepcopy(self.config.mcts),
+        curriculum_stage = self.meta_controller.curriculum_stage,
+        ablations = deepcopy(self.config.ablations),
+        eval_version = self.current_eval_version,
+        rollback_count = self.regression_guard.rollback_count,
+        benchmark_matches = self.benchmarks.total_matches,
+        rl_steps = self.rl.steps,
+        rl_epochs = self.rl.epochs,
+        pfsp_temperature = self.meta_controller.pfsp_temperature,
+        selfplay_ratio = deepcopy(self.meta_controller.selfplay_ratio),
+        world_model_enabled = self.world_model_loaded,
+        world_model_calls = self.world_model_stats.calls,
+        world_model_fallback = self.world_model_stats.fallback,
+        learned_critic_enabled = self.critic and self.critic.enabled or false,
+        learned_critic_updates = self.critic and self.critic.updates or 0,
+        learned_critic_loss = self.critic and self.critic.last_loss or 0,
+        muzero_enabled = self.config.muzero.enabled,
+        muzero_updates = self.muzero_stats and self.muzero_stats.updates or 0,
+        muzero_last_loss = self.muzero_stats and self.muzero_stats.last_loss or 0,
+        muzero_replay = self.muzero_replay and #self.muzero_replay or 0
+    }
+end
+
+
+function AI:batchEvaluateStates(states)
+    local out = {}
+    for i, st in ipairs(states or {}) do
+        out[i] = self:evaluateState(st)
+    end
+    return out
+end
+
+function AI:gpuBatchRollout(states)
+    local list = states or {}
+    local ok_torch = type(rawget(_G, "torch")) == "table" and self.nn_model and self.nn_model.forward
+    if ok_torch then
+        local features = {}
+        for i, st in ipairs(list) do
+            local f = self:extractFeatures(st)
+            features[i] = self:_criticFeatureVector(f)
+        end
+        local ok, vals = pcall(function()
+            local batch = _G.torch.tensor(features)
+            local pred = self.nn_model:forward(batch)
+            local out = {}
+            for i = 1, #list do out[i] = pred[i] end
+            return out
+        end)
+        if ok and vals then return vals end
+    end
+    return self:batchEvaluateStates(list)
+end
+
+function AI:runSearchSanityChecks()
+    local obs = self:_observeState()
+    local root = self:_initSimState(obs)
+    local act, top = self:mctsSearch(root, math.min(128, self.config.mcts.simulations or 128))
+    local score = self:evaluateState(self:_applyActionOrMacro(root, act or "idle", "idle", 6))
+    return {
+        action = act,
+        top_count = (top and #top) or 0,
+        score = score,
+        tt_size = (function(t) local c=0; for _ in pairs(t or {}) do c=c+1 end; return c end)(self.transposition),
+        replay_size = self.muzero_replay and #self.muzero_replay or 0,
+        human_confidence = self.human_policy and self.human_policy.confidence or 0
+    }
+end
+
+function AI:exportLearnedCritic()
+    if not self.critic then return nil end
+    return deepcopy(self.critic.weights)
+end
+
+function AI.baseline_random(rng)
+    local r = rng and rng() or math.random()
+    return ACTIONS[math.floor(r * #ACTIONS) + 1] or "idle"
+end
+
+function AI.baseline_fsm(distance)
+    if distance > 150 then return "walk_fwd" end
+    if distance < 50 then return "block" end
+    return "light"
+end
+
+function AI.baseline_greedy_eval(ai_instance, obs)
+    local best, best_score = "idle", -1e9
+    for _, a in ipairs(ACTIONS) do
+        local state = ai_instance:_initSimState(obs)
+        local next_state = ai_instance:_rolloutState(state, a, "idle", 6)
+        local score = ai_instance:evaluateState(next_state)
+        if score > best_score then best_score = score; best = a end
+    end
+    return best
+end
+
+function AI.baseline_no_search() return "light" end
+
+return AI

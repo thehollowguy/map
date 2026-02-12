@@ -1,0 +1,1955 @@
+-- Stellaris Strategic AI (Stockfish-style scalar evaluation)
+-- Design goals:
+-- 1) Single scalar score for empire state
+-- 2) Phase-aware weights (early/mid/late)
+-- 3) Risk-aware and monotonic-in-good-signals behavior
+-- 4) Adaptive fleet/tech meta with inertia (no thrashing)
+
+local StratAI = {}
+StratAI.__index = StratAI
+
+local PHASE = {
+    EARLY = "early",
+    MID = "mid",
+    LATE = "late"
+}
+
+local PHASE_WEIGHTS = {
+    early = { Eco = 0.40, Mil = 0.10, Tech = 0.15, Stab = 0.20, Pos = 0.15, Risk = 0.20 },
+    mid   = { Eco = 0.30, Mil = 0.25, Tech = 0.20, Stab = 0.10, Pos = 0.15, Risk = 0.25 },
+    late  = { Eco = 0.20, Mil = 0.35, Tech = 0.25, Stab = 0.05, Pos = 0.10, Risk = 0.30 }
+}
+
+local MEGASTRUCTURE_PRIORITY = {
+    "Mega Shipyard",
+    "Dyson Sphere",
+    "Matter Decompressor",
+    "Strategic Coordination Center",
+    "Science Nexus",
+    "Ring World"
+}
+
+local ROLE = {
+    GENERATOR = "Generator World",
+    MINING = "Mining World",
+    AGRI = "Agri World",
+    INDUSTRIAL = "Industrial World",
+    RESEARCH = "Research World",
+    FORTRESS = "Fortress World",
+    TRADE = "Trade World",
+    ECU_CANDIDATE = "Ecumenopolis Candidate",
+    BALANCED = "Balanced"
+}
+
+local function clamp(value, min_v, max_v)
+    if value < min_v then return min_v end
+    if value > max_v then return max_v end
+    return value
+end
+
+local function safe_number(value, fallback)
+    if type(value) ~= "number" then return fallback end
+    return value
+end
+
+local function deep_copy(tbl)
+    local out = {}
+    for k, v in pairs(tbl or {}) do
+        if type(v) == "table" then
+            out[k] = deep_copy(v)
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
+local function merge_config(user)
+    local defaults = {
+        colonize_habitability_floor = 60,
+        colonize_size_floor = 14,
+        megastructure_alloy_surplus_floor = 200,
+        inertia = 0.85,
+        war_horizon_months = 24,
+        action_horizon_years = 3,
+        risk_uncertainty_penalty = 0.05,
+        score_clip = 10.0,
+        doctrine_confirmations_required = 3,
+        doctrine_retry_cooldown = 2,
+        war_loss_tolerance = 0.35,
+        crisis_deficit_tolerance = 0.25,
+        irreversibility_phase_weight = { early = 1.0, mid = 0.8, late = 0.6 },
+        trend_sensitivity = { positive = 0.12, negative = 0.25 },
+        closure_thresholds = {
+            eco_surplus_per_pop = 2.0,
+            military_advantage = 0.6,
+            tech_parity_floor = 1.0
+        },
+        self_critique_period_years = 5,
+        confidence_bounds = { min = 0.7, max = 1.25 },
+        curiosity = {
+            enabled = true,
+            uncertainty_trigger = 0.55,
+            low_cost_limit = 0.35,
+            stagnation_window = 5,
+            stagnation_epsilon = 0.05,
+            desperation_bonus = 0.25,
+            exploration_share = 0.20,
+            max_eval_share = 0.08,
+            phase_modifier = { early = 1.0, mid = 0.7, late = 0.35 },
+            winning_uncurious_threshold = 0.75,
+            fragile_economy_block = true,
+            plan_lock_block = true,
+            irreversible_downside_block = true,
+            domain_decay = 0.65
+        },
+        ml_advisory = {
+            enabled = true,
+            max_weight_delta = 0.05,
+            max_risk_delta = 0.03
+        },
+        strategic = {
+            closure_confidence = 0.75,
+            break_rule_window_years = 8,
+            volatility_leverage = 0.12,
+            action_advantage_margin = 0.06,
+            cg_deficit_limit = -8,
+            cg_deficit_max_months = 12,
+            doctrine_pivot_threshold = -0.35
+        },
+        clausewitz = {
+            projection_months = { 12, 24, 36 },
+            uncertainty_band = 0.15,
+            bottleneck_rescan_months = 6,
+            doctrine_confidence_threshold = 3
+        },
+        priority_bias = {
+            early = { economy = 1.00, stability = 0.85, military = 0.60, tech = 0.70 },
+            mid = { economy = 0.90, stability = 0.70, military = 0.85, tech = 0.80 },
+            late = { economy = 0.65, stability = 0.55, military = 1.00, tech = 0.95 }
+        }
+    }
+
+    local cfg = deep_copy(defaults)
+    for k, v in pairs(user or {}) do
+        cfg[k] = v
+    end
+    return cfg
+end
+
+local function normalize_ratio(v)
+    return clamp(safe_number(v, 0), 0.0, 1.0)
+end
+
+local function logistic_like(x, scale)
+    local s = safe_number(scale, 1.0)
+    local z = safe_number(x, 0) / s
+    return z / (1 + math.abs(z))
+end
+
+local function deficit_penalty(x)
+    -- Exponential-like penalty for negative resources.
+    if x >= 0 then return 0 end
+    local mag = math.abs(x)
+    return (mag * mag) / (1 + mag)
+end
+
+local function weighted_sum(a, b)
+    local sum = 0
+    for k, v in pairs(a or {}) do
+        sum = sum + (safe_number(v, 0) * safe_number((b or {})[k], 0))
+    end
+    return sum
+end
+
+local function blend(old_v, new_v, inertia)
+    local i = clamp(safe_number(inertia, 0.85), 0.0, 0.999)
+    return old_v * i + new_v * (1.0 - i)
+end
+
+function StratAI.new(config)
+    local self = setmetatable({}, StratAI)
+    self.config = merge_config(config)
+
+    self.enemy_models = {}
+    self.galaxy_meta = {
+        avg_tech_tier = 1,
+        dominant_ship_class = "corvette",
+        dominant_damage_type = "mixed",
+        crisis_phase = "none",
+        total_wars_active = 0
+    }
+
+    self.last_eval = nil
+    self.current_plan = nil
+    self.matchup_memory = {}
+    self.pending_doctrine = nil
+    self.doctrine_confirmation_count = 0
+    self.current_doctrine = "balanced"
+    self.failed_doctrines = {}
+    self.doctrine_cooldowns = {}
+    self.metric_history = {}
+    self.heuristic_confidence = {
+        irreversibility = 1.0,
+        trajectory = 1.0,
+        closure = 1.0
+    }
+    self.last_self_critique_year = nil
+    self.eval_history = {}
+    self.curiosity_memory = {
+        counters = 1.0,
+        diplomacy = 1.0,
+        skirmish = 1.0
+    }
+    self.ml_advisory = {
+        weight_delta = { Eco = 0, Mil = 0, Tech = 0, Stab = 0, Pos = 0, Risk = 0 },
+        risk_delta = 0,
+        confidence = 1.0
+    }
+    self.empire_identity = "balanced_power"
+    self.failure_clocks = {}
+    self.enemy_mind_models = {}
+    self.decision_memory = {}
+    self.domain_confidence = { economy = 1.0, military = 1.0, technology = 1.0, diplomacy = 1.0 }
+    self.clausewitz_memory = {
+        bottleneck = { key = nil, months_locked = 0 },
+        doctrine_flags = {},
+        confidence_counters = {}
+    }
+
+    return self
+end
+
+function StratAI:_project_months_to_failure(stock, monthly_income, monthly_burn, emergency_floor)
+    local s = math.max(0, safe_number(stock, 0))
+    local net = safe_number(monthly_income, 0) - safe_number(monthly_burn, 0)
+    local floor = math.max(0, safe_number(emergency_floor, 0))
+    if net >= 0 then return 999 end
+    return clamp((s - floor) / math.abs(net), 0, 999)
+end
+
+function StratAI:global_irreversibility_trigger(state)
+    local c = self.config.clausewitz or {}
+    local uncertainty = 1 + safe_number(c.uncertainty_band, 0.15)
+
+    local econ_mtf = self:_project_months_to_failure(
+        safe_number(state.energy_stockpile, 0) + safe_number(state.cg_stockpile, 0),
+        safe_number(state.net_energy, 0) + safe_number(state.net_consumer_goods, 0),
+        safe_number(state.energy_burn, 0) + safe_number(state.cg_burn, 0),
+        0
+    ) / uncertainty
+
+    local mil_mtf = self:_project_months_to_failure(
+        safe_number(state.alloy_stockpile, 0),
+        safe_number(state.net_alloys, 0),
+        safe_number(state.projected_war_alloy_burn, 0),
+        safe_number(state.alloy_reserve_floor, 0)
+    ) / uncertainty
+
+    local tech_mtf = self:_project_months_to_failure(
+        safe_number(state.research_backlog, 0),
+        safe_number(state.total_research, 0),
+        safe_number(state.enemy_total_research, 0),
+        0
+    ) / uncertainty
+
+    local shortest = math.min(econ_mtf, mil_mtf, tech_mtf)
+    local penalty = 0
+    if shortest <= 12 then penalty = 1.0
+    elseif shortest <= 24 then penalty = 0.65
+    elseif shortest <= 36 then penalty = 0.35 end
+
+    return penalty, { economy = econ_mtf, military = mil_mtf, tech = tech_mtf, shortest = shortest }
+end
+
+function StratAI:update_bottleneck_override(state)
+    local lock = self.clausewitz_memory.bottleneck
+    local rescan = safe_number((self.config.clausewitz or {}).bottleneck_rescan_months, 6)
+    if lock.months_locked <= 0 or not lock.key or lock.months_locked % rescan == 0 then
+        local key = select(1, self:detect_bottleneck(state))
+        lock.key = key
+    end
+    lock.months_locked = math.max(0, safe_number(lock.months_locked, 0) + 1)
+    if safe_number(state.monthly_tick, 0) % rescan == 0 then
+        lock.months_locked = 0
+    end
+    self.clausewitz_memory.bottleneck = lock
+    return lock.key
+end
+
+function StratAI:update_doctrine_bucket(enemy_id, model)
+    local conf = self.clausewitz_memory.confidence_counters[enemy_id] or { value = 0 }
+    local flags = self.clausewitz_memory.doctrine_flags[enemy_id] or {
+        enemy_missile_heavy = false,
+        enemy_corvette_swarm = false,
+        enemy_artillery_line = false
+    }
+    conf.value = clamp(conf.value + 1, 0, 8)
+    local threshold = safe_number((self.config.clausewitz or {}).doctrine_confidence_threshold, 3)
+
+    if conf.value >= threshold then
+        flags.enemy_missile_heavy = safe_number(model.missile_usage, 0) >= 0.55
+        flags.enemy_corvette_swarm = safe_number(model.ship_class_corvette, 0) >= 0.55
+        flags.enemy_artillery_line = safe_number(model.ship_class_battleship, 0) >= 0.45 and safe_number(model.range_bias, 0) >= 0.55
+    end
+
+    conf.value = math.max(0, conf.value - 0.10) -- monthly confidence decay
+    self.clausewitz_memory.confidence_counters[enemy_id] = conf
+    self.clausewitz_memory.doctrine_flags[enemy_id] = flags
+    return flags, conf.value
+end
+
+function StratAI:_phase_priority_bias(phase)
+    local p = self.config.priority_bias or {}
+    return p[phase] or p.mid or { economy = 1, stability = 1, military = 1, tech = 1 }
+end
+
+function StratAI:_get_matchup_memory(enemy_id)
+    if not self.matchup_memory[enemy_id] then
+        self.matchup_memory[enemy_id] = {
+            shield_bias = 0,
+            armor_bias = 0,
+            evasion_bias = 0,
+            missile_bias = 0,
+            strike_craft_bias = 0,
+            aggression_bias = 0,
+            econ_focus = 0,
+            confirmations = 0
+        }
+    end
+    return self.matchup_memory[enemy_id]
+end
+
+-- ############################################################
+-- 1) PLANETS
+-- ############################################################
+
+function StratAI:score_colonization(planet)
+    local habitability = safe_number(planet.habitability, 0)
+    local size = safe_number(planet.size, 0)
+    local distance_cost = safe_number(planet.distance_upkeep, 0)
+
+    local special_bonus = 0
+    if planet.special_type == "relic" then special_bonus = special_bonus + 22 end
+    if planet.special_type == "gaia" then special_bonus = special_bonus + 24 end
+    if planet.special_type == "ring" then special_bonus = special_bonus + 25 end
+    if planet.special_type == "habitat" then special_bonus = special_bonus + 8 end
+    if planet.special_type == "tomb" then special_bonus = special_bonus - 8 end
+
+    local district_quality =
+        safe_number(planet.generator_cap, 0) +
+        safe_number(planet.mining_cap, 0) +
+        safe_number(planet.agri_cap, 0)
+
+    local score =
+        (habitability * 0.60) +
+        (size * 1.8) +
+        (district_quality * 0.50) +
+        special_bonus -
+        (distance_cost * 1.2)
+
+    return clamp(score, -100, 300)
+end
+
+function StratAI:should_colonize(planet)
+    local habitability = safe_number(planet.habitability, 0)
+    local size = safe_number(planet.size, 0)
+    local is_special = (planet.special_type ~= nil and planet.special_type ~= "")
+
+    local passes_gate =
+        habitability >= self.config.colonize_habitability_floor and
+        (size >= self.config.colonize_size_floor or is_special)
+
+    if not passes_gate then
+        return false, "Failed baseline colonization gate"
+    end
+
+    if self:score_colonization(planet) >= 65 then
+        return true, "Strong colonization target"
+    end
+
+    return false, "Colonization score below safety threshold"
+end
+
+function StratAI:assign_planet_role(planet)
+    local size = safe_number(planet.size, 0)
+    local gen_cap = safe_number(planet.generator_cap, 0)
+    local min_cap = safe_number(planet.mining_cap, 0)
+    local agri_cap = safe_number(planet.agri_cap, 0)
+
+    if planet.special_type == "relic" then
+        return planet.restore_ready and ROLE.ECU_CANDIDATE or ROLE.RESEARCH
+    end
+
+    if planet.special_type == "ecumenopolis" then
+        return ROLE.INDUSTRIAL
+    end
+
+    local max_cap = math.max(gen_cap, min_cap, agri_cap)
+
+    if size >= 20 and max_cap >= 8 then return ROLE.INDUSTRIAL end
+    if gen_cap == max_cap and gen_cap >= 5 then return ROLE.GENERATOR end
+    if min_cap == max_cap and min_cap >= 5 then return ROLE.MINING end
+    if agri_cap == max_cap and agri_cap >= 5 then return ROLE.AGRI end
+
+    return ROLE.BALANCED
+end
+
+function StratAI:district_policy(planet)
+    local size = safe_number(planet.size, 0)
+
+    if planet.special_type == "ecumenopolis" then
+        return { mode = "building_heavy", allow_agri = false, notes = "No agri districts on Ecumenopolis" }
+    end
+
+    if size <= 12 then
+        return { mode = "building_heavy", notes = "Small planets: buildings first" }
+    elseif size <= 18 then
+        return { mode = "hybrid", notes = "Medium planets: hybrid policy" }
+    end
+
+    return { mode = "district_heavy", notes = "Large planets: district scaling first" }
+end
+
+-- ############################################################
+-- 2) OPPONENT MODEL + META MEMORY
+-- ############################################################
+
+function StratAI:_empty_profile()
+    return {
+        evasion_bias = 0.0,
+        shield_bias = 0.0,
+        armor_bias = 0.0,
+        hull_bias = 0.0,
+        strike_craft = 0.0,
+        missile_usage = 0.0,
+        range_bias = 0.0,
+
+        ship_class_corvette = 0.0,
+        ship_class_cruiser = 0.0,
+        ship_class_battleship = 0.0,
+
+        tech_tier = 1.0,
+        uncertainty = 1.0
+    }
+end
+
+function StratAI:_did_conditions_change(enemy_id)
+    local m = self.matchup_memory[enemy_id]
+    if not m then return true end
+    local prev = m.last_conditions
+    local now = {
+        shield = safe_number(m.shield_bias, 0),
+        armor = safe_number(m.armor_bias, 0),
+        evasion = safe_number(m.evasion_bias, 0),
+        missile = safe_number(m.missile_bias, 0)
+    }
+    m.last_conditions = now
+    if not prev then return true end
+    local delta = math.abs(now.shield-prev.shield)+math.abs(now.armor-prev.armor)+math.abs(now.evasion-prev.evasion)+math.abs(now.missile-prev.missile)
+    return delta >= 0.20
+end
+
+function StratAI:record_failed_doctrine(enemy_id, doctrine)
+    if not enemy_id or not doctrine then return end
+    if not self.failed_doctrines[enemy_id] then self.failed_doctrines[enemy_id] = {} end
+    if not self.doctrine_cooldowns[enemy_id] then self.doctrine_cooldowns[enemy_id] = {} end
+    self.failed_doctrines[enemy_id][doctrine] = safe_number(self.failed_doctrines[enemy_id][doctrine], 0) + 1
+    self.doctrine_cooldowns[enemy_id][doctrine] = safe_number(self.config.doctrine_retry_cooldown, 2)
+end
+
+function StratAI:_failed_doctrine_penalty(enemy_id, doctrine)
+    local failures = (((self.failed_doctrines or {})[enemy_id] or {})[doctrine]) or 0
+    local cooldown = ((((self.doctrine_cooldowns or {})[enemy_id] or {})[doctrine]) or 0)
+    if failures <= 0 and cooldown <= 0 then return 0 end
+    if self:_did_conditions_change(enemy_id) then return 0 end
+    return math.min(0.45, failures * 0.12 + cooldown * 0.06)
+end
+
+function StratAI:update_opponent_model(enemy_id, observation)
+    local old = self.enemy_models[enemy_id] or self:_empty_profile()
+    local obs = observation or {}
+    local i = self.config.inertia
+
+    local new_model = {
+        evasion_bias = blend(old.evasion_bias, normalize_ratio(obs.evasion_bias), i),
+        shield_bias = blend(old.shield_bias, normalize_ratio(obs.shield_bias), i),
+        armor_bias = blend(old.armor_bias, normalize_ratio(obs.armor_bias), i),
+        hull_bias = blend(old.hull_bias, normalize_ratio(obs.hull_bias), i),
+        strike_craft = blend(old.strike_craft, normalize_ratio(obs.strike_craft), i),
+        missile_usage = blend(old.missile_usage, normalize_ratio(obs.missile_usage), i),
+        range_bias = blend(old.range_bias, normalize_ratio(obs.range_bias), i),
+
+        ship_class_corvette = blend(old.ship_class_corvette, normalize_ratio(obs.ship_class_corvette), i),
+        ship_class_cruiser = blend(old.ship_class_cruiser, normalize_ratio(obs.ship_class_cruiser), i),
+        ship_class_battleship = blend(old.ship_class_battleship, normalize_ratio(obs.ship_class_battleship), i),
+
+        tech_tier = blend(old.tech_tier, safe_number(obs.tech_tier, old.tech_tier), i),
+        uncertainty = blend(old.uncertainty, safe_number(obs.uncertainty, 0.5), i)
+    }
+
+    self.enemy_models[enemy_id] = new_model
+
+    local m = self:_get_matchup_memory(enemy_id)
+    m.shield_bias = blend(m.shield_bias, new_model.shield_bias, self.config.inertia)
+    m.armor_bias = blend(m.armor_bias, new_model.armor_bias, self.config.inertia)
+    m.evasion_bias = blend(m.evasion_bias, new_model.evasion_bias, self.config.inertia)
+    m.missile_bias = blend(m.missile_bias, new_model.missile_usage, self.config.inertia)
+    m.strike_craft_bias = blend(m.strike_craft_bias, new_model.strike_craft, self.config.inertia)
+    m.aggression_bias = blend(m.aggression_bias, normalize_ratio(obs.aggression_bias), self.config.inertia)
+    m.econ_focus = blend(m.econ_focus, normalize_ratio(obs.econ_focus), self.config.inertia)
+    m.confirmations = math.min(12, safe_number(m.confirmations, 0) + 1)
+
+    local doctrine_flags, doctrine_conf = self:update_doctrine_bucket(enemy_id, new_model)
+    m.doctrine_flags = doctrine_flags
+    m.doctrine_confidence = doctrine_conf
+
+    return new_model
+end
+
+function StratAI:recommended_counter_bias(enemy_id)
+    local m = self:_get_matchup_memory(enemy_id)
+    return {
+        tracking_weight = m.evasion_bias,
+        kinetic_weight = m.shield_bias,
+        energy_weight = m.armor_bias,
+        pd_weight = m.missile_bias,
+        strike_craft_weight = m.evasion_bias * 0.5 + (1.0 - m.strike_craft_bias) * 0.2
+    }
+end
+
+function StratAI:recommend_doctrine(enemy_id)
+    local bias = self:recommended_counter_bias(enemy_id)
+    local top_key, top_val = "kinetic_weight", -1
+    for k, v in pairs(bias) do
+        if v > top_val then
+            top_key, top_val = k, v
+        end
+    end
+
+    local doctrine = "balanced"
+    if top_key == "tracking_weight" then doctrine = "anti_evasion" end
+    if top_key == "kinetic_weight" then doctrine = "anti_shield" end
+    if top_key == "energy_weight" then doctrine = "anti_armor" end
+    if top_key == "pd_weight" then doctrine = "anti_missile" end
+
+    -- Commitment bias / inertia: require repeated confirmations before pivoting doctrine.
+    if self.pending_doctrine ~= doctrine then
+        self.pending_doctrine = doctrine
+        self.doctrine_confirmation_count = 1
+    else
+        self.doctrine_confirmation_count = self.doctrine_confirmation_count + 1
+    end
+
+    if self.doctrine_confirmation_count >= self.config.doctrine_confirmations_required then
+        local penalty = self:_failed_doctrine_penalty(enemy_id, doctrine)
+        if penalty > 0 then
+            return self.current_doctrine, "Doctrine pivot blocked by failed-counter memory"
+        end
+        self.current_doctrine = doctrine
+        return doctrine, "Doctrine pivot confirmed"
+    end
+
+    return self.current_doctrine or "balanced", "Insufficient confirmations for doctrine pivot"
+end
+
+function StratAI:update_galaxy_meta(meta_observation)
+    local old = self.galaxy_meta
+    local obs = meta_observation or {}
+    local i = self.config.inertia
+
+    local next_meta = {
+        avg_tech_tier = blend(old.avg_tech_tier, safe_number(obs.avg_tech_tier, old.avg_tech_tier), i),
+        dominant_ship_class = obs.dominant_ship_class or old.dominant_ship_class,
+        dominant_damage_type = obs.dominant_damage_type or old.dominant_damage_type,
+        crisis_phase = obs.crisis_phase or old.crisis_phase,
+        total_wars_active = blend(old.total_wars_active, safe_number(obs.total_wars_active, old.total_wars_active), i)
+    }
+
+    self.galaxy_meta = next_meta
+    return next_meta
+end
+
+function StratAI:compute_counter_score(our_fleet, enemy_profile)
+    local our = our_fleet or {}
+    local e = enemy_profile or self:_empty_profile()
+
+    local enemy_weakness = {
+        tracking = e.evasion_bias,
+        anti_shield = e.shield_bias,
+        anti_armor = e.armor_bias,
+        pd_strength = e.missile_usage,
+        alpha_damage = e.hull_bias,
+        range = 1.0 - e.range_bias
+    }
+
+    local our_weakness = {
+        tracking = 1.0 - normalize_ratio(safe_number(our.tracking, 0)),
+        anti_shield = 1.0 - normalize_ratio(safe_number(our.anti_shield, 0)),
+        anti_armor = 1.0 - normalize_ratio(safe_number(our.anti_armor, 0)),
+        pd_strength = 1.0 - normalize_ratio(safe_number(our.PD_strength, 0)),
+        alpha_damage = 1.0 - normalize_ratio(safe_number(our.alpha_damage, 0)),
+        range = 1.0 - normalize_ratio(safe_number(our.range, 0))
+    }
+
+    local our_vector = {
+        tracking = normalize_ratio(our.tracking),
+        anti_shield = normalize_ratio(our.anti_shield),
+        anti_armor = normalize_ratio(our.anti_armor),
+        pd_strength = normalize_ratio(our.PD_strength),
+        alpha_damage = normalize_ratio(our.alpha_damage),
+        range = normalize_ratio(our.range)
+    }
+
+    local enemy_threat_vector = {
+        tracking = e.evasion_bias,
+        anti_shield = e.shield_bias,
+        anti_armor = e.armor_bias,
+        pd_strength = e.missile_usage,
+        alpha_damage = e.hull_bias,
+        range = e.range_bias
+    }
+
+    local raw = weighted_sum(our_vector, enemy_weakness) - weighted_sum(enemy_threat_vector, our_weakness)
+    local normalized = clamp(logistic_like(raw, 2.5), -1.0, 1.0)
+
+    -- Uncertainty penalty reduces confidence in counters.
+    local uncertainty_penalty = safe_number(e.uncertainty, 0) * self.config.risk_uncertainty_penalty
+    return clamp(normalized - uncertainty_penalty, -1.0, 1.0)
+end
+
+function StratAI:_phase_irreversibility_weight(phase)
+    local w = self.config.irreversibility_phase_weight or {}
+    return safe_number(w[phase], safe_number(w.mid, 0.8))
+end
+
+function StratAI:irreversibility_index(state, phase)
+    local cost = 0
+
+    -- Relative pop growth loss compounds permanently.
+    local pop_diff = safe_number(state.enemy_pop_growth, 0) - safe_number(state.our_pop_growth, 0)
+    if pop_diff > 0 then
+        cost = cost + logistic_like(pop_diff, 2.0) * 0.35
+    end
+
+    -- Lost key chokepoints are often unrecoverable without huge war cost.
+    local lost_chokepoints = math.max(0, safe_number(state.key_chokepoints_lost, 0))
+    cost = cost + logistic_like(lost_chokepoints, 2.0) * 0.30
+
+    -- Missing battleship timing while rivals have it.
+    if state.enemy_has_battleships and not ((state.tech_flags or {}).battleships) then
+        cost = cost + 0.35
+    end
+
+    -- Megastructure race slippage.
+    local mega_gap = math.max(0, safe_number(state.enemy_megastructures_online, 0) - safe_number(state.our_megastructures_online, 0))
+    cost = cost + logistic_like(mega_gap, 2.0) * 0.25
+
+    -- Policy lockouts.
+    if state.synergy_locked_out then
+        cost = cost + 0.20
+    end
+
+    local phase_w = self:_phase_irreversibility_weight(phase)
+    local conf = safe_number(self.heuristic_confidence.irreversibility, 1.0)
+    return clamp(cost * phase_w * conf, 0, 3.0)
+end
+
+function StratAI:_update_metric_history(state)
+    local h = self.metric_history
+    h[#h+1] = {
+        our_power = safe_number(state.our_power, 0),
+        enemy_power = safe_number(state.enemy_power, 0),
+        our_alloy_pp = safe_number(state.our_alloy_per_pop, 0),
+        enemy_alloy_pp = safe_number(state.enemy_alloy_per_pop, 0),
+        our_replace = safe_number(state.our_reinforcement_speed, 0),
+        enemy_replace = safe_number(state.enemy_reinforcement_speed, 0),
+        our_tech = safe_number(state.tech_tier, 1),
+        enemy_tech = safe_number(state.enemy_tech_tier, 1),
+        our_pop_growth = safe_number(state.our_pop_growth, 0),
+        enemy_pop_growth = safe_number(state.enemy_pop_growth, 0)
+    }
+    if #h > 12 then table.remove(h, 1) end
+end
+
+function StratAI:trajectory_advantage()
+    local h = self.metric_history
+    if #h < 2 then return 0 end
+    local a, b = h[#h-1], h[#h]
+
+    local d_our = (b.our_power - a.our_power)
+    local d_enemy = (b.enemy_power - a.enemy_power)
+    local delta_adv = d_our - d_enemy
+
+    local alloy_trend = (b.our_alloy_pp - a.our_alloy_pp) - (b.enemy_alloy_pp - a.enemy_alloy_pp)
+    local repl_trend = (b.our_replace - a.our_replace) - (b.enemy_replace - a.enemy_replace)
+    local tech_trend = (b.our_tech - a.our_tech) - (b.enemy_tech - a.enemy_tech)
+    local pop_trend = (b.our_pop_growth - a.our_pop_growth) - (b.enemy_pop_growth - a.enemy_pop_growth)
+
+    local trend =
+        logistic_like(delta_adv, 1.5) * 0.35 +
+        logistic_like(alloy_trend, 0.5) * 0.25 +
+        logistic_like(repl_trend, 0.5) * 0.15 +
+        logistic_like(tech_trend, 0.3) * 0.15 +
+        logistic_like(pop_trend, 0.4) * 0.10
+
+    local sens = self.config.trend_sensitivity or { positive = 0.12, negative = 0.25 }
+    local conf = safe_number(self.heuristic_confidence.trajectory, 1.0)
+    if trend >= 0 then
+        return trend * safe_number(sens.positive, 0.12) * conf
+    end
+    return trend * safe_number(sens.negative, 0.25) * conf
+end
+
+function StratAI:_append_eval_history(value)
+    self.eval_history[#self.eval_history + 1] = safe_number(value, 0)
+    local max_keep = 24
+    if #self.eval_history > max_keep then table.remove(self.eval_history, 1) end
+end
+
+function StratAI:curiosity_domain(action)
+    if not action then return "counters" end
+    if action.type == "probe_diplomacy" or action.type == "seek_vassalization" then return "diplomacy" end
+    if action.type == "probe_skirmish" then return "skirmish" end
+    return "counters"
+end
+
+function StratAI:decay_curiosity_domain(domain)
+    local d = domain or "counters"
+    local mem = self.curiosity_memory
+    local factor = safe_number((self.config.curiosity or {}).domain_decay, 0.65)
+    mem[d] = clamp(safe_number(mem[d], 1.0) * factor, 0.2, 1.0)
+end
+
+function StratAI:refresh_curiosity_domains()
+    local mem = self.curiosity_memory
+    for k, v in pairs(mem) do
+        mem[k] = clamp(v + 0.03, 0.2, 1.0)
+    end
+end
+
+function StratAI:fragile_economy(state)
+    return safe_number(state.net_consumer_goods, 0) < 0 or safe_number(state.net_energy, 0) < 0 or safe_number(state.net_alloys, 0) <= 0
+end
+
+function StratAI:is_executing_long_plan(state)
+    return state.long_term_plan_locked == true or state.megastructure_in_progress == true
+end
+
+function StratAI:is_decisively_winning(state)
+    local e = safe_number((self.last_eval or {}).total, 0)
+    local t = safe_number((self.config.curiosity or {}).winning_uncurious_threshold, 0.75)
+    return e >= t and safe_number(state.military_advantage, 0) > 0.35 and safe_number(state.net_alloys, 0) > 0
+end
+
+function StratAI:curiosity_bonus(state, action, phase)
+    local c = self.config.curiosity or {}
+    if c.enabled == false then return 0, "disabled" end
+
+    if c.fragile_economy_block and self:fragile_economy(state) then return 0, "blocked_fragile_economy" end
+    if c.plan_lock_block and self:is_executing_long_plan(state) then return 0, "blocked_long_plan" end
+    if self:is_decisively_winning(state) then return 0, "blocked_winning" end
+
+    local uncertainty = normalize_ratio(state.intel_uncertainty)
+    local info_gain = normalize_ratio((action and action.info_gain) or 0.55)
+    local risk_tolerance = clamp(1.0 - normalize_ratio(state.projected_war_losses_alloy_ratio), 0.1, 1.0)
+    risk_tolerance = risk_tolerance * self:confidence_adjusted_aggression(state)
+    local phase_mod = safe_number((c.phase_modifier or {})[phase], 0.7)
+
+    local _, cur = self:curiosity_mode(state)
+    local base = uncertainty * info_gain * risk_tolerance * phase_mod
+    local with_mode = base + safe_number(cur.bonus, 0) * 0.25
+
+    local domain = self:curiosity_domain(action)
+    local decay = safe_number((self.curiosity_memory or {})[domain], 1.0)
+    local raw = with_mode * decay
+
+    if c.irreversible_downside_block and normalize_ratio(state.irreversible_downside_risk) > 0.5 then
+        return 0, "blocked_irreversible_risk"
+    end
+
+    local cap = safe_number(c.max_eval_share, 0.08) * safe_number(self.config.score_clip, 10.0)
+    return clamp(raw, 0, cap), "ok"
+end
+
+function StratAI:detect_stagnation()
+    local c = self.config.curiosity or {}
+    local window = math.max(3, safe_number(c.stagnation_window, 5))
+    if #self.eval_history < window then return false, 0 end
+
+    local start_idx = #self.eval_history - window + 1
+    local first = self.eval_history[start_idx]
+    local last = self.eval_history[#self.eval_history]
+    local slope = (last - first) / math.max(1, window - 1)
+    local eps = safe_number(c.stagnation_epsilon, 0.05)
+
+    if math.abs(slope) <= eps then
+        return true, slope
+    end
+    return false, slope
+end
+
+function StratAI:curiosity_mode(state)
+    local c = self.config.curiosity or {}
+    if c.enabled == false then
+        return false, { reason = "disabled", bonus = 0 }
+    end
+
+    local uncertainty = normalize_ratio(state.intel_uncertainty)
+    local low_cost = normalize_ratio(state.learning_cost)
+    local stagnating, slope = self:detect_stagnation()
+    local ponr, _ = self:point_of_no_return(state)
+
+    local should_explore = false
+    local bonus = 0
+    local reason = ""
+
+    if uncertainty >= safe_number(c.uncertainty_trigger, 0.55) and low_cost <= safe_number(c.low_cost_limit, 0.35) then
+        should_explore = true
+        bonus = bonus + 0.15
+        reason = "high-uncertainty low-cost scouting"
+    end
+
+    if stagnating then
+        should_explore = true
+        bonus = bonus + 0.10
+        reason = (reason ~= "" and (reason .. " + ") or "") .. "stagnation escape"
+    end
+
+    if ponr then
+        should_explore = true
+        bonus = bonus + safe_number(c.desperation_bonus, 0.25)
+        reason = (reason ~= "" and (reason .. " + ") or "") .. "desperation pivot"
+    end
+
+    return should_explore, { reason = reason, bonus = bonus, slope = slope }
+end
+
+function StratAI:is_exploratory_action(action)
+    if not action then return false end
+    if action.type == "redesign_fleet" then return true end
+    if action.type == "research" and action.target == "economy_tech" then return true end
+    if action.type == "tech_denial" then return true end
+    if action.type == "seek_vassalization" then return true end
+    return false
+end
+
+function StratAI:closure_mode_score(state)
+    local pops = math.max(1, safe_number(state.pops, 1))
+    local eco_pp = (safe_number(state.net_energy, 0) + safe_number(state.net_alloys, 0)) / pops
+    local mil = safe_number(state.military_advantage, 0)
+    local tech_parity = safe_number(state.tech_tier, 1) / math.max(1, safe_number(state.enemy_tech_tier, 1))
+
+    local th = self.config.closure_thresholds or {}
+    local ready =
+        eco_pp >= safe_number(th.eco_surplus_per_pop, 2.0) and
+        mil >= safe_number(th.military_advantage, 0.6) and
+        tech_parity >= safe_number(th.tech_parity_floor, 1.0)
+
+    if not ready then return 0 end
+
+    local closure_actions = normalize_ratio(state.border_seal_opportunity) + normalize_ratio(state.vassalization_window) + normalize_ratio(state.tech_denial_window) + normalize_ratio(state.war_exhaustion_abuse_window)
+    local conf = safe_number(self.heuristic_confidence.closure, 1.0)
+    return clamp(logistic_like(closure_actions, 1.5) * 0.35 * conf, 0, 1.2)
+end
+
+function StratAI:self_critique(state)
+    local year = safe_number(state.game_year, 0)
+    if self.last_self_critique_year and (year - self.last_self_critique_year) < safe_number(self.config.self_critique_period_years, 5) then
+        return nil
+    end
+
+    local h = self.metric_history
+    if #h < 3 then
+        self.last_self_critique_year = year
+        return nil
+    end
+
+    local predicted = safe_number(state.predicted_eval_delta, 0)
+    local observed = safe_number(state.observed_eval_delta, 0)
+    local err = math.abs(predicted - observed)
+
+    local bounds = self.config.confidence_bounds or { min = 0.7, max = 1.25 }
+    local adjust = (err > 0.35) and -0.03 or 0.01
+
+    for k, v in pairs(self.heuristic_confidence) do
+        self.heuristic_confidence[k] = clamp(v + adjust, safe_number(bounds.min, 0.7), safe_number(bounds.max, 1.25))
+    end
+
+    self:update_ml_advisory(predicted, observed)
+    self.last_self_critique_year = year
+    return { error = err, adjust = adjust }
+end
+
+-- ############################################################
+-- 3) STOCKFISH-STYLE EVAL
+-- E = wE*Eco + wM*Mil + wT*Tech + wS*Stab + wP*Pos - wR*Risk
+-- ############################################################
+
+function StratAI:score_economy(state)
+    local pops = math.max(1, safe_number(state.pops, 1))
+    local planets = math.max(1, safe_number(state.planet_count, 1))
+
+    local net_energy = safe_number(state.net_energy, 0)
+    local net_minerals = safe_number(state.net_minerals, 0)
+    local net_alloys = safe_number(state.net_alloys, 0)
+    local net_cg = safe_number(state.net_consumer_goods, 0)
+
+    local energy_pp = net_energy / pops
+    local minerals_pp = net_minerals / pops
+    local alloys_pp = net_alloys / pops
+    local cg_pp = net_cg / pops
+
+    local capacity_pp = safe_number(state.unused_district_capacity, 0) / planets
+    local pop_eff = safe_number(state.pop_efficiency, 0)
+
+    local base =
+        logistic_like(energy_pp, 2.5) * 0.18 +
+        logistic_like(minerals_pp, 2.5) * 0.18 +
+        logistic_like(alloys_pp, 1.5) * 0.28 +
+        logistic_like(cg_pp, 1.2) * 0.20 +
+        logistic_like(capacity_pp, 4.0) * 0.08 +
+        logistic_like(pop_eff, 1.0) * 0.08
+
+    -- Heavy non-linear deficit penalties.
+    local penalty =
+        deficit_penalty(energy_pp) * 0.25 +
+        deficit_penalty(minerals_pp) * 0.25 +
+        deficit_penalty(alloys_pp) * 0.35 +
+        deficit_penalty(cg_pp) * 0.75
+
+    if self.galaxy_meta.crisis_phase ~= "none" then
+        penalty = penalty * (1.0 - self.config.crisis_deficit_tolerance)
+    end
+
+    return clamp(base - penalty, -3.0, 3.0)
+end
+
+function StratAI:score_military(state)
+    local cap_usage = normalize_ratio(state.naval_cap_usage_ratio)
+    local alloy_pp = safe_number(state.net_alloys, 0) / math.max(1, safe_number(state.pops, 1))
+    local ship_tier = safe_number(state.ship_tech_tier, 1)
+    local gal_tier = math.max(1, safe_number(self.galaxy_meta.avg_tech_tier, 1))
+    local tier_parity = ship_tier / gal_tier
+
+    local diversity = normalize_ratio(state.fleet_diversity)
+    local chokepoint = normalize_ratio(state.chokepoint_coverage)
+    local border_proximity = normalize_ratio(state.border_fleet_proximity)
+
+    local econ_negative = (safe_number(state.net_energy, 0) < 0 or safe_number(state.net_consumer_goods, 0) < 0)
+    local econ_penalty = econ_negative and 0.45 or 0.0
+
+    local enemy_counter_risk = normalize_ratio(state.enemy_counter_risk)
+    local avg_ship_build_time = math.max(0.1, safe_number(state.avg_ship_build_time, 1.0))
+    local shipyards_online = math.max(1, safe_number(state.shipyards_online, 1))
+    local reinforcement_time = avg_ship_build_time / shipyards_online
+    local reinforcement_penalty = logistic_like(reinforcement_time, 3.0) * 0.22
+
+    local score =
+        cap_usage * 0.20 +
+        logistic_like(alloy_pp, 1.5) * 0.25 +
+        logistic_like(tier_parity - 1.0, 0.5) * 0.25 +
+        diversity * 0.12 +
+        chokepoint * 0.12 +
+        border_proximity * 0.08 -
+        enemy_counter_risk * 0.15 -
+        reinforcement_penalty -
+        econ_penalty
+
+    return clamp(score, -3.0, 3.0)
+end
+
+function StratAI:score_tech(state)
+    local pops = math.max(1, safe_number(state.pops, 1))
+    local research_pp = safe_number(state.total_research, 0) / pops
+    local our_tier = safe_number(state.tech_tier, 1)
+    local gal_tier = math.max(1, safe_number(self.galaxy_meta.avg_tech_tier, 1))
+    local parity = our_tier / gal_tier
+
+    local flags = state.tech_flags or {}
+    local key_unlock_score = 0
+    key_unlock_score = key_unlock_score + (flags.battleships and 0.20 or 0)
+    key_unlock_score = key_unlock_score + (flags.titans and 0.15 or 0)
+    key_unlock_score = key_unlock_score + (flags.repeatables and 0.20 or 0)
+    key_unlock_score = key_unlock_score + (flags.neutron_launchers and 0.10 or 0)
+    key_unlock_score = key_unlock_score + (flags.arc_emitters and 0.10 or 0)
+    key_unlock_score = key_unlock_score + (flags.strike_craft_3 and 0.05 or 0)
+    key_unlock_score = key_unlock_score + (flags.hyper_relays and 0.05 or 0)
+    key_unlock_score = key_unlock_score + (flags.gateways and 0.05 or 0)
+
+    local pressure_gap_penalty = 0
+    if state.enemy_has_battleships and not flags.battleships then
+        pressure_gap_penalty = pressure_gap_penalty + 0.35
+    end
+
+    local score =
+        logistic_like(research_pp, 2.0) * 0.45 +
+        logistic_like(parity - 1.0, 0.5) * 0.35 +
+        key_unlock_score * 0.45 -
+        pressure_gap_penalty
+
+    return clamp(score, -3.0, 3.0)
+end
+
+function StratAI:score_stability(state)
+    local avg_stability = safe_number(state.avg_planet_stability, 50)
+    local amenities = safe_number(state.amenities_surplus, 0)
+    local crime = safe_number(state.avg_crime, 0)
+    local faction = safe_number(state.faction_approval, 50)
+    local revolt_risk = normalize_ratio(state.revolt_risk)
+
+    local score =
+        logistic_like((avg_stability - 50) / 10.0, 1.0) * 0.50 +
+        logistic_like(amenities, 8.0) * 0.20 +
+        logistic_like((faction - 50) / 10.0, 1.0) * 0.20 -
+        logistic_like(crime, 20.0) * 0.20 -
+        revolt_risk * 0.60
+
+    if avg_stability < 40 then
+        score = score - 0.60
+    end
+    if state.active_revolt_timer then
+        score = score - 1.20
+    end
+
+    return clamp(score, -3.0, 3.0)
+end
+
+function StratAI:score_position(state)
+    local chokepoints = normalize_ratio(state.chokepoints_owned_ratio)
+    local hyperlane_depth = normalize_ratio(state.hyperlane_depth)
+    local border_friction = normalize_ratio(state.border_friction)
+    local gateways = normalize_ratio(state.gateway_access)
+    local critical_chokepoints = math.max(1, safe_number(state.critical_chokepoints, 1))
+    local hinterland_ratio = normalize_ratio(state.empire_behind_two_chokepoints_ratio)
+    local depth_collapse_penalty = 0
+    if hinterland_ratio > 0.60 then
+        depth_collapse_penalty = math.min(0.8, (hinterland_ratio - 0.60) * 2.0 + logistic_like(critical_chokepoints, 3.0) * 0.3)
+    end
+
+    local score =
+        chokepoints * 0.40 +
+        hyperlane_depth * 0.30 +
+        gateways * 0.20 -
+        border_friction * 0.25 -
+        depth_collapse_penalty
+
+    return clamp(score, -3.0, 3.0)
+end
+
+function StratAI:score_risk(state)
+    local upcoming_wars = normalize_ratio(state.upcoming_wars_risk)
+    local hostile_neighbors = normalize_ratio(state.hostile_neighbors_ratio)
+    local crisis_proximity = normalize_ratio(state.crisis_proximity)
+    local dangerous_events = normalize_ratio(state.unresolved_dangerous_events)
+    local volatility = normalize_ratio(state.resource_volatility)
+
+    local score =
+        upcoming_wars * 0.25 +
+        hostile_neighbors * 0.20 +
+        crisis_proximity * 0.25 +
+        dangerous_events * 0.15 +
+        volatility * 0.15
+
+    return clamp(score, 0.0, 3.0)
+end
+
+function StratAI:record_decision_why(action, why, state)
+    self.decision_memory[#self.decision_memory + 1] = {
+        action = action and action.type or "none",
+        why = why or "",
+        time = safe_number(state and state.game_year, 0),
+        snapshot = {
+            reinforcement_time = safe_number(state and state.reinforcement_time, 0),
+            counter_score = safe_number(state and state.counter_score, 0),
+            net_cg = safe_number(state and state.net_consumer_goods, 0)
+        }
+    }
+    if #self.decision_memory > 64 then table.remove(self.decision_memory, 1) end
+end
+
+function StratAI:update_domain_confidence(state)
+    local err = math.abs(safe_number(state.predicted_eval_delta, 0) - safe_number(state.observed_eval_delta, 0))
+    local step = (err > 0.35) and -0.02 or 0.01
+    for k, v in pairs(self.domain_confidence) do
+        self.domain_confidence[k] = clamp(v + step, 0.55, 1.20)
+    end
+    return self.domain_confidence
+end
+
+function StratAI:confidence_adjusted_aggression(state)
+    local c = self.domain_confidence
+    local military_c = safe_number(c.military, 1.0)
+    local diplomacy_c = safe_number(c.diplomacy, 1.0)
+    return clamp((military_c + diplomacy_c) * 0.5, 0.55, 1.15)
+end
+
+function StratAI:detect_bottleneck(state)
+    local bottlenecks = {
+        alloys = (safe_number(state.net_alloys, 0) < 5) and (10 - safe_number(state.net_alloys, 0)) or 0,
+        pops = (safe_number(state.our_pop_growth, 0) < safe_number(state.enemy_pop_growth, 0)) and (safe_number(state.enemy_pop_growth,0)-safe_number(state.our_pop_growth,0)) * 5 or 0,
+        naval_cap = math.max(0, normalize_ratio(state.naval_cap_usage_ratio) - 0.95) * 10,
+        tech_tier = math.max(0, safe_number(state.enemy_tech_tier, 1) - safe_number(state.tech_tier, 1)) * 4,
+        influence = (safe_number(state.influence_income, 1) < 1) and (1 - safe_number(state.influence_income,1)) * 6 or 0
+    }
+    local best, val = "alloys", -1
+    for k, v in pairs(bottlenecks) do
+        if v > val then best, val = k, v end
+    end
+    return best, val, bottlenecks
+end
+
+function StratAI:window_model(state)
+    local windows = {
+        military_window = clamp(logistic_like(safe_number(state.military_advantage,0), 0.8), -1, 1),
+        tech_window = clamp(logistic_like(safe_number(state.tech_tier,1)-safe_number(state.enemy_tech_tier,1), 0.5), -1, 1),
+        economic_safety_window = clamp(logistic_like(safe_number(state.net_energy,0)+safe_number(state.net_alloys,0), 25), -1, 1)
+    }
+    return windows
+end
+
+function StratAI:hard_no_guardrails(state, action)
+    local break_window = state.rule_break_window == true
+    local shortest = safe_number((state.failure_clocks or {}).shortest, 999)
+    local extinction_risk = shortest <= 8
+
+    if action.type == "declare_war" and normalize_ratio(state.two_front_war_risk) > 0.5 and not extinction_risk then
+        return false, "Hard NO: avoid two-front war"
+    end
+
+    local cg_limit = safe_number((self.config.strategic or {}).cg_deficit_limit, -8)
+    local cg_months = safe_number(state.cg_deficit_months, 0)
+    local cg_max_m = safe_number((self.config.strategic or {}).cg_deficit_max_months, 12)
+    if safe_number(state.net_consumer_goods, 0) <= cg_limit and cg_months > cg_max_m and not break_window then
+        return false, "Hard NO: prolonged severe CG deficit"
+    end
+
+    local pivot_th = safe_number((self.config.strategic or {}).doctrine_pivot_threshold, -0.35)
+    if action.type == "redesign_fleet" and state.at_war and safe_number(state.counter_score, 0) >= pivot_th and not break_window then
+        return false, "Hard NO: no mid-war doctrine pivot"
+    end
+
+    return true, "Hard guardrails passed"
+end
+
+function StratAI:estimate_failure_clocks(state)
+    local clocks = {}
+
+    local econ_deficit = math.max(0, -safe_number(state.net_energy, 0)) + math.max(0, -safe_number(state.net_consumer_goods, 0))
+    clocks.economy = (econ_deficit > 0) and (24 / (1 + econ_deficit)) or 999
+
+    local mil_gap = math.max(0, safe_number(state.enemy_power, 0) - safe_number(state.our_power, 0))
+    local reinforce_adv = math.max(0.1, safe_number(state.our_reinforcement_speed, 1)) / math.max(0.1, safe_number(state.enemy_reinforcement_speed, 1))
+    clocks.military = (mil_gap > 0) and (30 / (1 + mil_gap * 0.01) * reinforce_adv) or 999
+
+    local tech_gap = math.max(0, safe_number(state.enemy_tech_tier, 1) - safe_number(state.tech_tier, 1))
+    local our_research = math.max(0.1, safe_number(state.total_research, 1))
+    local enemy_research = math.max(0.1, safe_number(state.enemy_total_research, our_research))
+    local tech_velocity_ratio = our_research / enemy_research
+    clocks.tech = (tech_gap > 0) and (36 / (1 + tech_gap) * tech_velocity_ratio) or 999
+
+    local pop_gap_growth = math.max(0, safe_number(state.enemy_pop_growth, 0) - safe_number(state.our_pop_growth, 0))
+    clocks.population = (pop_gap_growth > 0) and (40 / (1 + pop_gap_growth)) or 999
+
+    clocks.shortest = math.min(clocks.economy, clocks.military, clocks.tech, clocks.population)
+    self.failure_clocks = clocks
+    return clocks
+end
+
+function StratAI:effective_game_over(state)
+    local production_locked = normalize_ratio(state.enemy_production_contestable) < 0.2
+    local borders_sealed = normalize_ratio(state.border_seal_opportunity) > 0.75
+    local tech_locked = (safe_number(state.tech_tier, 1) / math.max(1, safe_number(state.enemy_tech_tier, 1))) >= 1.1
+    local allies_irrelevant = normalize_ratio(state.enemy_allied_support) < 0.25
+
+    local confidence = 0
+    confidence = confidence + (production_locked and 0.30 or 0)
+    confidence = confidence + (borders_sealed and 0.25 or 0)
+    confidence = confidence + (tech_locked and 0.25 or 0)
+    confidence = confidence + (allies_irrelevant and 0.20 or 0)
+
+    local threshold = safe_number((self.config.strategic or {}).closure_confidence, 0.75)
+    return confidence >= threshold, confidence
+end
+
+function StratAI:update_enemy_mind_model(enemy_id, signal)
+    local m = self.enemy_mind_models[enemy_id] or { risk_tolerance = 0.5, overreact = 0.5, turtle = 0.5, bad_war_accept = 0.5 }
+    local i = self.config.inertia
+    m.risk_tolerance = blend(m.risk_tolerance, normalize_ratio(signal.risk_tolerance), i)
+    m.overreact = blend(m.overreact, normalize_ratio(signal.overreact), i)
+    m.turtle = blend(m.turtle, normalize_ratio(signal.turtle), i)
+    m.bad_war_accept = blend(m.bad_war_accept, normalize_ratio(signal.bad_war_accept), i)
+    self.enemy_mind_models[enemy_id] = m
+    return m
+end
+
+function StratAI:pressure_psychology_score(state)
+    if not state.primary_rival then return 0 end
+    local m = self.enemy_mind_models[state.primary_rival] or { risk_tolerance = 0.5, overreact = 0.5, turtle = 0.5, bad_war_accept = 0.5 }
+    local border_pressure = normalize_ratio(state.border_pressure_window)
+    local bait_window = normalize_ratio(state.fake_weakness_window)
+    local defense_trap = normalize_ratio(state.prepared_defense_window)
+    local s = border_pressure * m.overreact * 0.35 + bait_window * m.bad_war_accept * 0.35 + defense_trap * (1 - m.turtle) * 0.30
+    return clamp(s, 0, 1.2)
+end
+
+function StratAI:volatility_opportunity(state)
+    local vol = normalize_ratio(state.galactic_volatility)
+    local crisis_near_rival = normalize_ratio(state.crisis_near_rival)
+    local desperation = (self.failure_clocks.shortest and self.failure_clocks.shortest < 24) and 1 or 0
+    local conservative = (desperation == 0) and (1 - normalize_ratio(state.intel_uncertainty)) or 1
+    local lever = safe_number((self.config.strategic or {}).volatility_leverage, 0.12)
+    return clamp((vol * crisis_near_rival * conservative + desperation * vol) * lever, -0.5, 0.8)
+end
+
+function StratAI:update_empire_identity(state)
+    local eco = safe_number(state.net_energy, 0) + safe_number(state.net_alloys, 0)
+    local mil = safe_number(state.military_advantage, 0)
+    local tech = safe_number(state.tech_tier, 1) - safe_number(state.enemy_tech_tier, 1)
+
+    if eco > 25 and mil > 0 and tech >= 0 then
+        self.empire_identity = "economic_hegemon"
+    elseif mil < -0.2 and tech < 0 then
+        self.empire_identity = "militarized_underdog"
+    elseif tech > 0.3 then
+        self.empire_identity = "tech_snowball"
+    else
+        self.empire_identity = "balanced_power"
+    end
+    return self.empire_identity
+end
+
+function StratAI:identity_consistency_penalty(action)
+    if not action then return 0 end
+    local id = self.empire_identity or "balanced_power"
+    if id == "economic_hegemon" and action.type == "declare_war" then return 0.10 end
+    if id == "militarized_underdog" and action.type == "build" and action.target == "research_lab" then return 0.08 end
+    if id == "tech_snowball" and action.type == "seal_borders" then return 0.05 end
+    return 0
+end
+
+function StratAI:rule_break_window(state)
+    local clocks = self.failure_clocks
+    local shortest = safe_number(clocks.shortest, 999)
+    local last_timing = normalize_ratio(state.last_viable_timing_window)
+    local overextension = normalize_ratio(state.enemy_overextension_window)
+    local chaos = (self.galaxy_meta.crisis_phase ~= "none") and 1 or 0
+
+    local trigger = shortest <= safe_number((self.config.strategic or {}).break_rule_window_years, 8) or last_timing > 0.7 or overextension > 0.7 or chaos == 1
+    return trigger
+end
+
+function StratAI:apply_ml_advisory_to_weights(weights)
+    local cfg = self.config.ml_advisory or {}
+    if cfg.enabled == false then return weights end
+
+    local out = deep_copy(weights)
+    local deltas = (self.ml_advisory or {}).weight_delta or {}
+    local max_d = safe_number(cfg.max_weight_delta, 0.05)
+
+    for _, k in ipairs({"Eco","Mil","Tech","Stab","Pos","Risk"}) do
+        local d = clamp(safe_number(deltas[k], 0), -max_d, max_d)
+        out[k] = math.max(0, safe_number(out[k], 0) + d)
+    end
+
+    return out
+end
+
+function StratAI:update_ml_advisory(predicted_delta, observed_delta)
+    local cfg = self.config.ml_advisory or {}
+    if cfg.enabled == false then return end
+
+    local err = safe_number(observed_delta, 0) - safe_number(predicted_delta, 0)
+    local max_w = safe_number(cfg.max_weight_delta, 0.05)
+    local step = clamp(err * 0.01, -0.01, 0.01)
+
+    self.ml_advisory.weight_delta.Eco = clamp(safe_number(self.ml_advisory.weight_delta.Eco,0) + step, -max_w, max_w)
+    self.ml_advisory.weight_delta.Mil = clamp(safe_number(self.ml_advisory.weight_delta.Mil,0) - step*0.5, -max_w, max_w)
+    self.ml_advisory.weight_delta.Tech = clamp(safe_number(self.ml_advisory.weight_delta.Tech,0) + step*0.4, -max_w, max_w)
+
+    local max_r = safe_number(cfg.max_risk_delta, 0.03)
+    self.ml_advisory.risk_delta = clamp(safe_number(self.ml_advisory.risk_delta,0) - err*0.005, -max_r, max_r)
+end
+
+function StratAI:get_phase_weights(phase)
+    return PHASE_WEIGHTS[phase] or PHASE_WEIGHTS[PHASE.MID]
+end
+
+function StratAI:evaluate_state(state, phase)
+    local w = deep_copy(self:get_phase_weights(phase))
+    w = self:apply_ml_advisory_to_weights(w)
+
+    if self.galaxy_meta.crisis_phase ~= "none" then
+        w.Mil = w.Mil + 0.10
+        w.Eco = w.Eco + 0.05
+        w.Pos = math.max(0.02, w.Pos - 0.05)
+    end
+
+    local Eco = self:score_economy(state)
+    local Mil = self:score_military(state)
+    local Tech = self:score_tech(state)
+    local Stab = self:score_stability(state)
+    local Pos = self:score_position(state)
+    local Risk = self:score_risk(state)
+
+    local trend_term = self:trajectory_advantage()
+    local irreversibility = self:irreversibility_index(state, phase)
+    local clausewitz_irreversibility, mtf_detail = self:global_irreversibility_trigger(state)
+    local closure = self:closure_mode_score(state)
+    local psycho = self:pressure_psychology_score(state)
+    local volatility = self:volatility_opportunity(state)
+
+    local E =
+        (w.Eco * Eco) +
+        (w.Mil * Mil) +
+        (w.Tech * Tech) +
+        (w.Stab * Stab) +
+        (w.Pos * Pos) -
+        (math.max(0, w.Risk + safe_number((self.ml_advisory or {}).risk_delta, 0)) * Risk) +
+        trend_term +
+        closure +
+        psycho +
+        volatility -
+        irreversibility -
+        clausewitz_irreversibility
+
+    E = clamp(E, -self.config.score_clip, self.config.score_clip)
+
+    self.last_eval = {
+        phase = phase,
+        total = E,
+        components = {
+            Eco = Eco, Mil = Mil, Tech = Tech, Stab = Stab, Pos = Pos, Risk = Risk,
+            Trend = trend_term, Irreversibility = irreversibility, ClausewitzIrreversibility = clausewitz_irreversibility,
+            TimeToFailure = mtf_detail, Closure = closure,
+            PressurePsychology = psycho, Volatility = volatility
+        },
+        weights = deep_copy(w)
+    }
+
+    self:_append_eval_history(E)
+    return E, self.last_eval
+end
+
+-- ############################################################
+-- 4) WAR & META PRESSURE LOGIC
+-- ############################################################
+
+function StratAI:point_of_no_return(state)
+    local enemy_alloy_pp = safe_number(state.enemy_alloy_per_pop, 0)
+    local our_alloy_pp = math.max(0.01, safe_number(state.our_alloy_per_pop, 0.01))
+    local alloy_ratio = enemy_alloy_pp / our_alloy_pp
+
+    local no_expansion = state.expansion_paths_left == 0
+    local megastructure_pressure = state.enemy_has_megastructures and (safe_number(state.tech_tier,1) + 0.5 < safe_number(state.enemy_tech_tier,1))
+
+    local triggered = (alloy_ratio > 1.45 and no_expansion) or (megastructure_pressure and alloy_ratio > 1.20)
+    if triggered then
+        return true, {
+            risk_tolerance_boost = 0.20,
+            war_threshold_delta = -0.08,
+            allow_gambles = true
+        }
+    end
+
+    return false, { risk_tolerance_boost = 0, war_threshold_delta = 0, allow_gambles = false }
+end
+
+function StratAI:war_commit_score(state)
+    local mil_advantage = logistic_like(safe_number(state.military_advantage, 0), 1.0)
+    local counter_score = clamp(safe_number(state.counter_score, 0), -1.0, 1.0)
+    local positional_adv = logistic_like(safe_number(state.positional_advantage, 0), 1.0)
+    local risk_threshold = safe_number(state.risk_threshold, 0.25)
+
+    local ponr, ponr_adj = self:point_of_no_return(state)
+    risk_threshold = risk_threshold + safe_number(ponr_adj.war_threshold_delta, 0)
+
+    local score = mil_advantage * counter_score * positional_adv
+    local can_win_24m = state.projected_war_win_months and state.projected_war_win_months <= self.config.war_horizon_months
+
+    if not can_win_24m then
+        score = score - 0.30
+    end
+
+    local projected_losses = normalize_ratio(state.projected_war_losses_alloy_ratio)
+    local no_surplus = safe_number(state.net_alloys, 0) <= 0 or safe_number(state.net_energy, 0) <= 0
+    if projected_losses > self.config.war_loss_tolerance and no_surplus and not ponr then
+        return -1.0, risk_threshold, "War veto: loss tolerance exceeded without surplus"
+    end
+
+    return score, risk_threshold, "War score computed"
+end
+
+function StratAI:should_start_war(state)
+    local score, threshold, reason = self:war_commit_score(state)
+    if score > threshold then
+        return true, "War conditions satisfied"
+    end
+    return false, reason or "War score below threshold"
+end
+
+function StratAI:meta_pressure_adjustments(state)
+    local g = self.galaxy_meta
+    local flags = state.tech_flags or {}
+    local adjustments = {
+        tech_urgency = 0,
+        military_urgency = 0,
+        economy_urgency = 0
+    }
+
+    if g.dominant_ship_class == "cruiser" and not flags.battleships then
+        adjustments.tech_urgency = adjustments.tech_urgency + 0.30
+    end
+
+    if g.avg_tech_tier >= 4 and not flags.repeatables then
+        adjustments.tech_urgency = adjustments.tech_urgency + 0.35
+    end
+
+    if g.crisis_phase ~= "none" then
+        adjustments.military_urgency = adjustments.military_urgency + 0.40
+    end
+
+    if safe_number(state.enemy_alloy_per_pop, 0) > safe_number(state.our_alloy_per_pop, 0) then
+        adjustments.economy_urgency = adjustments.economy_urgency + 0.20
+        adjustments.military_urgency = adjustments.military_urgency + 0.20
+    end
+
+    if state.enemy_has_megastructures then
+        adjustments.economy_urgency = adjustments.economy_urgency + 0.20
+    end
+
+    if state.enemy_has_ecumenopolis then
+        adjustments.military_urgency = adjustments.military_urgency + 0.15
+    end
+
+    if safe_number(state.hostile_neighbors_ratio, 0) <= 0.05
+       and safe_number(state.military_advantage, 0) > 0
+       and safe_number(state.net_energy, 0) > 0
+       and safe_number(state.net_alloys, 0) > 0 then
+        adjustments.tech_urgency = adjustments.tech_urgency * 0.85
+    end
+
+    return adjustments
+end
+
+-- ############################################################
+-- 5) ACTION GENERATION + SHALLOW SIMULATION
+-- ############################################################
+
+function StratAI:generate_actions(state)
+    local actions = {}
+
+    actions[#actions + 1] = { type = "delay_stockpile" }
+
+    if state.can_build then
+        actions[#actions + 1] = { type = "build", target = "alloy_foundry" }
+        actions[#actions + 1] = { type = "build", target = "research_lab" }
+        actions[#actions + 1] = { type = "build", target = "generator_district" }
+    end
+
+    if state.can_research then
+        actions[#actions + 1] = { type = "research", target = "military_tech" }
+        actions[#actions + 1] = { type = "research", target = "economy_tech" }
+    end
+
+    if state.can_redesign_fleet then
+        actions[#actions + 1] = { type = "redesign_fleet", target = "adaptive_counter" }
+    end
+
+    if state.can_colonize and state.best_colony_candidate then
+        actions[#actions + 1] = { type = "colonize", target = state.best_colony_candidate }
+    end
+
+    if state.can_declare_war then
+        actions[#actions + 1] = { type = "declare_war", target = state.primary_rival }
+    end
+
+    if normalize_ratio(state.border_seal_opportunity) > 0.5 then
+        actions[#actions + 1] = { type = "seal_borders" }
+    end
+    if normalize_ratio(state.vassalization_window) > 0.5 then
+        actions[#actions + 1] = { type = "seek_vassalization" }
+    end
+    if normalize_ratio(state.tech_denial_window) > 0.5 then
+        actions[#actions + 1] = { type = "tech_denial" }
+    end
+
+    if state.effective_game_over then
+        actions[#actions + 1] = { type = "vassalization_chain" }
+        actions[#actions + 1] = { type = "chokehold_war" }
+        actions[#actions + 1] = { type = "exhaustion_manipulation" }
+        actions[#actions + 1] = { type = "attrition_abuse" }
+    end
+
+    if normalize_ratio(state.intel_uncertainty) > 0.5 and normalize_ratio(state.learning_cost) < 0.4 then
+        actions[#actions + 1] = { type = "probe_skirmish" }
+        actions[#actions + 1] = { type = "probe_diplomacy" }
+        actions[#actions + 1] = { type = "test_counter" }
+    end
+
+    return actions
+end
+
+function StratAI:simulate_shallow(state, action, years)
+    local horizon = clamp(safe_number(years, self.config.action_horizon_years), 1, 5)
+    local s = deep_copy(state)
+
+    if action.type == "build" and action.target == "alloy_foundry" then
+        s.net_alloys = safe_number(s.net_alloys, 0) + 8 * horizon
+        s.net_minerals = safe_number(s.net_minerals, 0) - 4 * horizon
+        s.net_energy = safe_number(s.net_energy, 0) - 2 * horizon
+    elseif action.type == "build" and action.target == "research_lab" then
+        s.total_research = safe_number(s.total_research, 0) + 18 * horizon
+        s.net_consumer_goods = safe_number(s.net_consumer_goods, 0) - 4 * horizon
+        s.tech_tier = safe_number(s.tech_tier, 1) + 0.05 * horizon
+    elseif action.type == "build" and action.target == "generator_district" then
+        s.net_energy = safe_number(s.net_energy, 0) + 10 * horizon
+        s.unused_district_capacity = math.max(0, safe_number(s.unused_district_capacity, 0) - 1)
+    elseif action.type == "research" and action.target == "military_tech" then
+        s.ship_tech_tier = safe_number(s.ship_tech_tier, 1) + 0.10 * horizon
+        s.tech_tier = safe_number(s.tech_tier, 1) + 0.08 * horizon
+    elseif action.type == "research" and action.target == "economy_tech" then
+        s.pop_efficiency = safe_number(s.pop_efficiency, 0) + 0.08 * horizon
+        s.tech_tier = safe_number(s.tech_tier, 1) + 0.06 * horizon
+    elseif action.type == "redesign_fleet" then
+        s.enemy_counter_risk = math.max(0, safe_number(s.enemy_counter_risk, 0) - 0.20)
+        s.net_alloys = safe_number(s.net_alloys, 0) - 3 * horizon
+    elseif action.type == "colonize" then
+        s.planet_count = safe_number(s.planet_count, 1) + 1
+        s.pops = safe_number(s.pops, 1) + 2 * horizon
+        s.net_consumer_goods = safe_number(s.net_consumer_goods, 0) - 2 * horizon
+        s.unused_district_capacity = safe_number(s.unused_district_capacity, 0) + 4
+    elseif action.type == "declare_war" then
+        s.upcoming_wars_risk = clamp(safe_number(s.upcoming_wars_risk, 0) + 0.40, 0, 1)
+        s.net_alloys = safe_number(s.net_alloys, 0) - 6 * horizon
+        s.military_advantage = safe_number(s.military_advantage, 0) + 0.15
+        s.projected_war_win_months = safe_number(s.projected_war_win_months, 36) - 6 * horizon
+    elseif action.type == "delay_stockpile" then
+        s.net_alloys = safe_number(s.net_alloys, 0) + 4 * horizon
+        s.net_energy = safe_number(s.net_energy, 0) + 3 * horizon
+        s.resource_volatility = math.max(0, safe_number(s.resource_volatility, 0) - 0.05)
+    elseif action.type == "seal_borders" then
+        s.border_friction = math.max(0, safe_number(s.border_friction, 0) - 0.15)
+        s.hostile_neighbors_ratio = math.max(0, safe_number(s.hostile_neighbors_ratio, 0) - 0.10)
+    elseif action.type == "seek_vassalization" then
+        s.military_advantage = safe_number(s.military_advantage, 0) + 0.08
+        s.upcoming_wars_risk = math.max(0, safe_number(s.upcoming_wars_risk, 0) - 0.05)
+    elseif action.type == "tech_denial" then
+        s.enemy_tech_tier = math.max(0.5, safe_number(s.enemy_tech_tier, 1) - 0.05 * horizon)
+        s.tech_denial_window = math.max(0, safe_number(s.tech_denial_window, 0) - 0.2)
+    elseif action.type == "probe_skirmish" then
+        s.intel_uncertainty = math.max(0, safe_number(s.intel_uncertainty, 0) - 0.20)
+        s.enemy_counter_risk = math.max(0, safe_number(s.enemy_counter_risk, 0) - 0.12)
+        s.net_alloys = safe_number(s.net_alloys, 0) - 1 * horizon
+    elseif action.type == "probe_diplomacy" then
+        s.hostile_neighbors_ratio = math.max(0, safe_number(s.hostile_neighbors_ratio, 0) - 0.05)
+        s.intel_uncertainty = math.max(0, safe_number(s.intel_uncertainty, 0) - 0.10)
+    elseif action.type == "test_counter" then
+        s.intel_uncertainty = math.max(0, safe_number(s.intel_uncertainty, 0) - 0.15)
+        s.enemy_counter_risk = math.max(0, safe_number(s.enemy_counter_risk, 0) - 0.18)
+        s.net_alloys = safe_number(s.net_alloys, 0) - 2 * horizon
+    elseif action.type == "vassalization_chain" then
+        s.enemy_production_contestable = math.max(0, safe_number(s.enemy_production_contestable, 1) - 0.20)
+        s.vassalization_window = math.max(0, safe_number(s.vassalization_window, 0) - 0.30)
+    elseif action.type == "chokehold_war" then
+        s.border_seal_opportunity = math.max(0, safe_number(s.border_seal_opportunity, 0) - 0.25)
+        s.hostile_neighbors_ratio = math.max(0, safe_number(s.hostile_neighbors_ratio, 0) - 0.08)
+    elseif action.type == "exhaustion_manipulation" then
+        s.war_exhaustion_abuse_window = math.max(0, safe_number(s.war_exhaustion_abuse_window, 0) - 0.35)
+        s.upcoming_wars_risk = math.max(0, safe_number(s.upcoming_wars_risk, 0) - 0.07)
+    elseif action.type == "attrition_abuse" then
+        s.enemy_reinforcement_speed = math.max(0.1, safe_number(s.enemy_reinforcement_speed, 1) - 0.12)
+        s.projected_war_losses_alloy_ratio = math.max(0, safe_number(s.projected_war_losses_alloy_ratio, 0) - 0.08)
+    end
+
+    return s
+end
+
+function StratAI:clausewitz_what_if(state, action, phase)
+    local cfg = self.config.clausewitz or {}
+    local months = cfg.projection_months or { 12, 24, 36 }
+    local total = 0
+    local count = 0
+    local traces = {}
+    for _, m in ipairs(months) do
+        local years = clamp(m / 12.0, 1, 5)
+        local projected = self:simulate_shallow(state, action, years)
+        projected.rule_break_window = state.rule_break_window
+        local s = self:evaluate_state(projected, phase)
+        total = total + s
+        count = count + 1
+        traces[#traces + 1] = { months = m, score = s }
+    end
+    local avg = (count > 0) and (total / count) or self:evaluate_state(state, phase)
+    return avg, traces
+end
+
+function StratAI:explain_eval_snapshot(state)
+    local e = self.last_eval and self.last_eval.components or {}
+    return {
+        total = self.last_eval and self.last_eval.total or 0,
+        bottleneck = state.active_bottleneck,
+        failure_shortest = (state.failure_clocks or {}).shortest,
+        eco = e.Eco or 0,
+        mil = e.Mil or 0,
+        tech = e.Tech or 0,
+        risk = e.Risk or 0,
+        irreversibility = (e.Irreversibility or 0) + (e.ClausewitzIrreversibility or 0)
+    }
+end
+
+function StratAI:select_best_action(state, phase)
+    local actions = self:generate_actions(state)
+    local best_action = nil
+    local best_score = -math.huge
+
+    local curiosity_on, _ = self:curiosity_mode(state)
+    local bottleneck, bottleneck_val = self:detect_bottleneck(state)
+    local active_bottleneck = state.active_bottleneck or bottleneck
+
+    local wait_score = self:clausewitz_what_if(state, { type = "delay_stockpile" }, phase)
+
+    for _, action in ipairs(actions) do
+        local projected = self:simulate_shallow(state, action, self.config.action_horizon_years)
+        projected.rule_break_window = state.rule_break_window
+
+        local hard_ok, hard_reason = self:hard_no_guardrails(projected, action)
+        if not hard_ok then
+            self:record_decision_why(action, hard_reason, state)
+            goto continue
+        end
+
+        local safe, _ = self:panic_guardrails(projected, action)
+        if not safe then
+            goto continue
+        end
+
+        if action.type == "declare_war" then
+            local ok, why = self:should_start_war(projected)
+            if not ok then
+                self:record_decision_why(action, why, state)
+                goto continue
+            end
+        end
+
+        local score, what_if_trace = self:clausewitz_what_if(state, action, phase)
+        action.what_if_trace = what_if_trace
+        score = self:uncertainty_adjusted_score(score, projected)
+        score = score - self:identity_consistency_penalty(action)
+
+        if projected.rule_break_window and (action.type == "declare_war" or action.type == "redesign_fleet") then
+            score = score + 0.08
+        end
+
+        if curiosity_on and self:is_exploratory_action(action) then
+            local bonus, reason = self:curiosity_bonus(projected, action, phase)
+            action.curiosity_reason = reason
+            score = score + bonus
+        end
+
+        if bottleneck_val > 0 then
+            if active_bottleneck == "alloys" and action.type == "build" and action.target == "alloy_foundry" then score = score + 0.10 end
+            if active_bottleneck == "tech_tier" and action.type == "research" and action.target == "military_tech" then score = score + 0.10 end
+            if active_bottleneck == "naval_cap" and action.type == "seal_borders" then score = score + 0.06 end
+            if active_bottleneck == "influence" and action.type == "delay_stockpile" then score = score + 0.04 end
+        end
+
+        local base_margin = safe_number((self.config.strategic or {}).action_advantage_margin, 0.06)
+        local uncertainty_margin = normalize_ratio(state.intel_uncertainty) * 0.05
+        local crisis_margin = normalize_ratio(state.crisis_proximity) * 0.05
+        local empire_scale_margin = math.min(0.08, safe_number(state.empire_size, 0) * 0.0005)
+        local margin = base_margin + uncertainty_margin + crisis_margin + empire_scale_margin
+        if action.type ~= "delay_stockpile" and score < (wait_score + margin) then
+            self:record_decision_why(action, "Counterfactual fail: wait is better", state)
+            goto continue
+        end
+
+        if score > best_score then
+            best_score = score
+            best_action = action
+            self:record_decision_why(action, "Selected by max constrained eval", state)
+        end
+
+        ::continue::
+    end
+
+    if not best_action then
+        return { type = "delay_stockpile" }, wait_score
+    end
+
+    return best_action, best_score
+end
+
+-- ############################################################
+-- 6) EVENTS + ANOMALIES + MEGASTRUCTURES
+-- ############################################################
+
+local HIGH_RISK_EVENT_KEYS = {
+    shroud = true,
+    dimensional_portal = true,
+    worm = true,
+    horizon_signal = true
+}
+
+function StratAI:choose_event_option(event, empire)
+    local hostile_fleet = safe_number(event.hostile_fleet_power, 0)
+    local own_fleet = safe_number(empire.fleet_power, 0)
+
+    if event.key and HIGH_RISK_EVENT_KEYS[event.key] then
+        if own_fleet >= hostile_fleet * 1.25 then
+            return "accept", "High-risk event allowed only while strong"
+        end
+        return "delay", "High-risk event deferred"
+    end
+
+    local reward = event.permanent_modifier or event.tech_unlock or event.relic_reward
+    if reward and own_fleet >= hostile_fleet then
+        return "accept", "Rewarded event accepted"
+    end
+
+    if reward and hostile_fleet > own_fleet then
+        return "delay", "Reward high but threat currently too high"
+    end
+
+    if event.category == "existential_threat" then
+        return "refuse", "Existential event rejected"
+    end
+
+    return "accept", "Default safe acceptance"
+end
+
+function StratAI:should_research_anomaly(anomaly, scientist, game_phase)
+    local difficulty = safe_number(anomaly.difficulty, 0)
+    local skill = safe_number(scientist.skill, 1)
+
+    if difficulty > skill + 1 then
+        return false, "Skip: exceeds safe skill threshold"
+    end
+
+    if game_phase == PHASE.EARLY then
+        if anomaly.precursor_related then return true, "Early precursor priority" end
+        if difficulty <= skill then return true, "Early low-risk anomaly" end
+        return false, "Early survey tempo priority"
+    end
+
+    if game_phase == PHASE.MID then
+        return true, "Mid backlog cleanup"
+    end
+
+    if anomaly.has_relic or anomaly.strategic_resource or anomaly.unique_modifier then
+        return true, "Late high-value anomaly only"
+    end
+
+    return false, "Late low-value anomalies ignored"
+end
+
+function StratAI:should_start_megastructure(empire)
+    local stable = empire.economy_stable == true
+    local alloy_surplus = safe_number(empire.alloy_surplus_monthly, 0)
+    local cap_near_max = safe_number(empire.naval_cap_used_ratio, 0) >= 0.85
+    return stable and alloy_surplus >= self.config.megastructure_alloy_surplus_floor and cap_near_max
+end
+
+function StratAI:next_megastructure(empire)
+    if not self:should_start_megastructure(empire) then
+        return nil, "Megastructure gate not passed"
+    end
+
+    if empire.currently_building_megastructure then
+        return nil, "Already building one megastructure"
+    end
+
+    local built = empire.built_megastructures or {}
+    for _, name in ipairs(MEGASTRUCTURE_PRIORITY) do
+        if not built[name] then
+            if name == "Ring World" and not built["Dyson Sphere"] then
+                -- Do not build Ring World before energy solved.
+            else
+                return name, "Priority-selected megastructure"
+            end
+        end
+    end
+
+    return nil, "No pending megastructure choice"
+end
+
+-- ############################################################
+-- 7) FAILURE MODES + MAIN LOOP
+-- ############################################################
+
+function StratAI:detect_failure_modes(empire)
+    local failures = {}
+
+    if safe_number(empire.low_habitability_colonies, 0) >= 3 then
+        failures[#failures + 1] = "Over-colonizing low-habitability worlds"
+    end
+    if empire.mixed_role_planets then
+        failures[#failures + 1] = "Mixed-role planet sprawl"
+    end
+    if safe_number(empire.housing_deficit_worlds, 0) > 0 then
+        failures[#failures + 1] = "Housing/amenities ignored"
+    end
+    if empire.early_city_spam then
+        failures[#failures + 1] = "Overbuilt city districts early"
+    end
+    if empire.megastructure_started_without_surplus then
+        failures[#failures + 1] = "Megastructure start without alloy surplus"
+    end
+    if empire.auto_clicked_anomalies then
+        failures[#failures + 1] = "Auto-clicked anomaly queue"
+    end
+    if safe_number(empire.consumer_goods, 0) <= 0 then
+        failures[#failures + 1] = "Consumer goods collapse"
+    end
+
+    return failures
+end
+
+function StratAI:observe_state(raw_state)
+    return deep_copy(raw_state or {})
+end
+
+function StratAI:update_models(observation)
+    self:update_galaxy_meta(observation.galaxy_meta or {})
+
+    for enemy_id, data in pairs(observation.enemy_observations or {}) do
+        self:update_opponent_model(enemy_id, data)
+        self:update_enemy_mind_model(enemy_id, {
+            risk_tolerance = data.risk_tolerance,
+            overreact = data.overreact,
+            turtle = data.turtle,
+            bad_war_accept = data.bad_war_accept
+        })
+    end
+
+    if observation.primary_rival and self.enemy_models[observation.primary_rival] then
+        observation.counter_score = self:compute_counter_score(
+            observation.our_fleet_vector or {},
+            self.enemy_models[observation.primary_rival]
+        )
+    else
+        observation.counter_score = safe_number(observation.counter_score, 0)
+    end
+
+    return observation
+end
+
+function StratAI:commit_action(action)
+    self.current_plan = action
+    return action
+end
+
+
+function StratAI:compute_priority_queue(state, phase)
+    local b = self:_phase_priority_bias(phase)
+    local queue = {
+        { key = "economy", value = math.max(0, -safe_number(state.net_consumer_goods, 0)) * 2 + math.max(0, -safe_number(state.net_energy, 0)) },
+        { key = "stability", value = math.max(0, 50 - safe_number(state.avg_planet_stability, 50)) + safe_number(state.revolt_risk, 0) * 30 },
+        { key = "military", value = safe_number(state.hostile_neighbors_ratio, 0) * 20 + safe_number(state.crisis_proximity, 0) * 25 },
+        { key = "tech", value = math.max(0, safe_number(self.galaxy_meta.avg_tech_tier, 1) - safe_number(state.tech_tier, 1)) * 12 }
+    }
+
+    for _, item in ipairs(queue) do
+        item.value = item.value * safe_number(b[item.key], 1)
+    end
+
+    table.sort(queue, function(a, b2) return a.value > b2.value end)
+    return queue
+end
+
+function StratAI:panic_guardrails(state, action)
+    local break_window = state.rule_break_window == true
+
+    if action.type == "declare_war" then
+        if safe_number(state.net_consumer_goods, 0) < 0 and not break_window then
+            return false, "Panic guard: no war during CG deficit"
+        end
+        if safe_number(state.avg_planet_stability, 50) < 45 and not break_window then
+            return false, "Panic guard: no war while unstable"
+        end
+    end
+
+    if action.type == "redesign_fleet" and state.at_war and not break_window then
+        return false, "Panic guard: reinforce during war, avoid full redesign"
+    end
+
+    return true, "Action passes panic guard"
+end
+
+function StratAI:uncertainty_adjusted_score(score, state)
+    local intel_uncertainty = safe_number(state.intel_uncertainty, 0)
+    local damp = clamp(1.0 - intel_uncertainty * self.config.risk_uncertainty_penalty * 2.0, 0.7, 1.0)
+    return score * damp
+end
+
+-- Compatibility aliases mirroring the fighting-game loop names.
+function StratAI:sense(raw_state)
+    return self:observe_state(raw_state)
+end
+
+function StratAI:update_model(observation)
+    return self:update_models(observation)
+end
+
+function StratAI:generate_options(state)
+    return self:generate_actions(state)
+end
+
+function StratAI:evaluate(state, phase)
+    return self:evaluate_state(state, phase)
+end
+
+function StratAI:commit(action)
+    return self:commit_action(action)
+end
+
+function StratAI:tick(raw_observation)
+    -- Main control loop:
+    -- observe_state -> update_opponent_model -> generate_actions -> simulate_shallow -> evaluate -> commit_action
+    local state = self:observe_state(raw_observation)
+    state = self:update_models(state)
+    self:_update_metric_history(state)
+
+    for enemy_id, c in pairs(self.doctrine_cooldowns or {}) do
+        for d, v in pairs(c) do
+            c[d] = math.max(0, safe_number(v, 0) - 1)
+        end
+        self.doctrine_cooldowns[enemy_id] = c
+    end
+
+    local phase = state.phase or PHASE.MID
+    state.failure_clocks = self:estimate_failure_clocks(state)
+    state.identity = self:update_empire_identity(state)
+    state.windows = self:window_model(state)
+    state.bottleneck, state.bottleneck_value, state.bottleneck_map = self:detect_bottleneck(state)
+    state.active_bottleneck = self:update_bottleneck_override(state)
+    state.effective_game_over, state.closure_confidence = self:effective_game_over(state)
+    state.rule_break_window = self:rule_break_window(state)
+    state.priority_queue = self:compute_priority_queue(state, phase)
+
+    if state.primary_rival then
+        state.recommended_doctrine, state.doctrine_reason = self:recommend_doctrine(state.primary_rival)
+    end
+
+    state.curiosity_enabled, state.curiosity_meta = self:curiosity_mode(state)
+
+    local action, score = self:select_best_action(state, phase)
+    state.eval_explain = self:explain_eval_snapshot(state)
+
+    if not action then
+        action = { type = "delay_stockpile" }
+        score = self:evaluate_state(state, phase)
+    end
+
+    self:commit_action(action)
+    if self:is_exploratory_action(action) then
+        self:decay_curiosity_domain(self:curiosity_domain(action))
+    else
+        self:refresh_curiosity_domains()
+    end
+    state.self_critique = self:self_critique(state)
+    state.domain_confidence = self:update_domain_confidence(state)
+    return action, score, self.last_eval
+end
+
+return StratAI
